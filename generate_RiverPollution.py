@@ -43,13 +43,16 @@ def create_dataset(problem_function, num_samples):
     # Evaluate objectives for each sample
     for i, sample in enumerate(samples):
         evaluation_result = problem.evaluate(sample)
-        objectives[i, :] = evaluation_result.objectives  # Directly access the 'objectives' attribute
+        objectives[i, :] = evaluation_result.objectives
 
     # Combine the variables and objectives into one dataset
     data = np.hstack((samples, objectives))
 
-    # Convert to DataFrame
-    column_names = [var.name for var in problem.variables] + [obj.name for obj in problem.objectives]
+    # Generate standardized column names
+    variable_column_names = [f"x_{i+1}" for i in range(num_variables)]
+    objective_column_names = [f"f_{i+1}" for i in range(len(problem.objectives))]
+    column_names = variable_column_names + objective_column_names
+    
     df = pd.DataFrame(data, columns=column_names)
 
     # Save as CSV in the problem's directory

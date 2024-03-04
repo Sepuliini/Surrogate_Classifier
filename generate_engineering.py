@@ -22,41 +22,37 @@ def create_directory_for_problem(problem_name):
     os.makedirs(problem_dir, exist_ok=True)
     return problem_dir
 
-# Function to create datasets
 def create_dataset(problem_function, num_samples):
-    # Generate the problem instance
     problem = problem_function()
     num_variables = len(problem.variables)
+    num_objectives = len(problem.objectives)
     problem_name = problem_function.__name__
 
-    # Create directory for the current problem
     problem_dir = create_directory_for_problem(problem_name)
 
-    # Generate random samples within the variable bounds
     samples = np.empty((num_samples, num_variables))
     for i, var in enumerate(problem.variables):
         lower_bound, upper_bound = var.get_bounds()
         samples[:, i] = np.random.uniform(lower_bound, upper_bound, num_samples)
 
-    # Initialize an array for objectives
-    objectives = np.empty((num_samples, len(problem.objectives)))
-
-    # Evaluate objectives for each sample
+    objectives = np.empty((num_samples, num_objectives))
     for i, sample in enumerate(samples):
         evaluation_result = problem.evaluate(sample)
-        objectives[i, :] = evaluation_result.objectives  # Directly access the 'objectives' attribute
+        objectives[i, :] = evaluation_result.objectives
 
-    # Combine the variables and objectives into one dataset
     data = np.hstack((samples, objectives))
 
-    # Convert to DataFrame
-    column_names = [var.name for var in problem.variables] + [obj.name for obj in problem.objectives]
+    # Generate standardized column names
+    variable_column_names = [f"x_{i+1}" for i in range(num_variables)]
+    objective_column_names = [f"f_{i+1}" for i in range(num_objectives)]
+    column_names = variable_column_names + objective_column_names
+
     df = pd.DataFrame(data, columns=column_names)
 
-    # Save as CSV in the problem's directory
     csv_filename = os.path.join(problem_dir, f"{problem_name}_{num_samples}_samples.csv")
     df.to_csv(csv_filename, index=False)
     print(f"Saved dataset to {csv_filename}")
+
 
 # Define the number of samples for each problem
 num_samples_options = [100, 150, 200, 250, 300, 350, 400, 500, 600, 700, 800, 900, 1000, 1200, 1500, 2000]

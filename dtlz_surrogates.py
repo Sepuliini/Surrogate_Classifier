@@ -13,9 +13,20 @@ from sklearn.neural_network import MLPRegressor
 from xgboost import XGBRegressor
 import random
 from datetime import datetime
-
+import logging 
 import warnings
-warnings.filterwarnings("ignore")
+
+# Setup logging
+log_dir = path.join(getcwd(), "logs")
+if not path.exists(log_dir):
+    makedirs(log_dir)
+log_file = datetime.now().strftime("model_training_%Y-%m-%d_%H-%M-%S.log")
+logging.basicConfig(filename=path.join(log_dir, log_file), level=logging.INFO, 
+                    format='%(asctime)s %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+# Replace warnings.filterwarnings("ignore") with logging.captureWarnings(True)
+logging.captureWarnings(True)
+
 
 # Start timing the script
 script_start = datetime.now()
@@ -62,7 +73,8 @@ R2results = pd.DataFrame(np.zeros((len(selected_files), 2*len(algorithms) + 1)),
 
 # Iterate over selected files and train each algorithm
 for i, file in enumerate(selected_files):
-    print(f"Processing file {i + 1} of {len(selected_files)}: {file}")
+    logging.info(f"Processing file {i + 1} of {len(selected_files)}: {file}")
+
     fullfilename = path.join(data_folder, file)
     data = pd.read_csv(fullfilename)
     inputs = data.iloc[:, :-2]  # Assuming the last two columns are targets
@@ -90,14 +102,15 @@ for i, file in enumerate(selected_files):
 
         model_end = datetime.now()
         training_duration = (model_end - model_start).total_seconds()
-        print(f"Trained {algo} on {file} for f1 & f2 in {training_duration:.2f} seconds")
+        logging.info(f"Trained {algo} on {file} for f1 & f2 in {training_duration:.2f} seconds")
+        
 
 # Save R^2 results to CSV in the output folder
 R2results_filename = path.join(output_folder, "R2results.csv")
 R2results.to_csv(R2results_filename, index=False)
-print(f"R^2 results saved to {R2results_filename}")
+logging.info(f"R^2 results saved to {R2results_filename}")
 
 # End timing the script and print elapsed time
 script_end = datetime.now()
 elapsed_time = (script_end - script_start).total_seconds()
-print(f"Script finished in {elapsed_time:.2f} seconds.")
+logging.info(f"Script finished in {elapsed_time:.2f} seconds.")
