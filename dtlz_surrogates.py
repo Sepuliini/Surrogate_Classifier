@@ -77,7 +77,7 @@ for i, file in enumerate(selected_files):
 
     fullfilename = path.join(data_folder, file)
     data = pd.read_csv(fullfilename)
-    inputs = data.iloc[:, :-2]  # Assuming the last two columns are targets
+    inputs = data.iloc[:, :-2] 
     f1 = data.iloc[:, -2]       # Second-to-last column as the first target
     f2 = data.iloc[:, -1]       # Last column as the second target
     
