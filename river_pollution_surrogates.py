@@ -70,7 +70,7 @@ for file in selected_files:
     logging.info(f"Processing file: {fullfilename}")
 
     data = pd.read_csv(fullfilename)
-    inputs = data.iloc[:, :-5]  # Assuming the last 5 columns are objectives
+    inputs = data.iloc[:, :-5] 
     for i in range(1, 6):
         objective = f'f_{i}'
         y = data[objective]
