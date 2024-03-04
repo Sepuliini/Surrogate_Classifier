@@ -70,7 +70,7 @@ for file in files:
     logging.info(f"Processing file: {fullfilename}")
 
     data = pd.read_csv(fullfilename)
-    inputs = data.iloc[:, :-5]  # Assuming the last 5 columns are objectives
+    inputs = data.iloc[:, :-5] 
     objectives = data.columns[-5:]  # Capture the 5 objective column names
 
     for objective in objectives:
