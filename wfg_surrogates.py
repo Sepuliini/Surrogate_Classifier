@@ -107,7 +107,7 @@ for i, (problem_folder, file) in enumerate(selected_files):
         R2results = R2results.append({'File': file, 'Model': algo, 'Objective': 'f1', 'R2_Score': score_f1}, ignore_index=True)
         R2results = R2results.append({'File': file, 'Model': algo, 'Objective': 'f2', 'R2_Score': score_f2}, ignore_index=True)
 
-# Save R^2 results to CSV specifically named for WFG results
+# Save R^2 results to CSV 
 R2results_filename = path.join(output_folder, "WFG_R2_results.csv")
 R2results.to_csv(R2results_filename, index=False)
 logging.info(f"WFG R^2 results saved to {R2results_filename}")
