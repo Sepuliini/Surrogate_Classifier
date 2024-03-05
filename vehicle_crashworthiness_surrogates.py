@@ -88,7 +88,7 @@ for file in selected_files:
 
             R2results = R2results.append({'File': file, 'Model': algo_name, 'Objective': objective, 'R2_Score': score}, ignore_index=True)
 
-# Save R^2 results to CSV specifically named for vehicle crashworthiness results
+# Save R^2 results to CSV
 R2results_filename = path.join(output_folder, "VehicleCrashworthiness_R2_Results.csv")
 R2results.to_csv(R2results_filename, index=False)
 logging.info("Surrogate modeling for Vehicle Crashworthiness problem completed.")
