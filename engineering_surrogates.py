@@ -100,7 +100,6 @@ for problem in problems:
             obj_data = data[objective]
             inputs_train, inputs_test, obj_train, obj_test = tts(inputs, obj_data, test_size=0.3, random_state=42)
 
-            # Correctly iterate over model dictionary instead of algorithms list
             for algo_name, algo in model.items():  # This line is corrected
                 model_start = datetime.now()
                 clf = algo()
@@ -120,7 +119,7 @@ for problem in problems:
                 }, ignore_index=True)
             
 
-# Save R^2 results to CSV specifically named for engineering results
+# Save R^2 results to CSV 
 R2results_filename = path.join(output_folder, "Engineering_R2_results.csv")
 R2results.to_csv(R2results_filename, index=False)
 logging.info(f"Engineering R^2 results saved to {R2results_filename}")
