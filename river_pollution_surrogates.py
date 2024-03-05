@@ -94,7 +94,7 @@ for file in selected_files:
                 'R2_Score': score
             }, ignore_index=True)
 
-# Save R^2 results to CSV specifically named for river pollution results
+# Save R^2 results to CSV 
 R2results_filename = path.join(output_folder, "RiverPollution_R2_Results.csv")
 R2results.to_csv(R2results_filename, index=False)
 logging.info("Surrogate modeling for River Pollution problem completed.")
