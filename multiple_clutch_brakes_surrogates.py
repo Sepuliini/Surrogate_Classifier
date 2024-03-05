@@ -95,7 +95,7 @@ for file in files:
                 'R2_Score': score
             }, ignore_index=True)
 
-# Save R^2 results to CSV specifically named for the problem
+# Save R^2 results to CSV 
 R2results_filename = path.join(output_folder, "Multiple_Clutch_Brakes_R2_results.csv")
 R2results.to_csv(R2results_filename, index=False)
 logging.info(f"Multiple Clutch Brakes R2 results saved to {R2results_filename}")
