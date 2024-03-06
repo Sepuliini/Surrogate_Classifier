@@ -100,7 +100,7 @@ for problem in problems:
             obj_data = data[objective]
             inputs_train, inputs_test, obj_train, obj_test = tts(inputs, obj_data, test_size=0.3, random_state=42)
 
-            for algo_name, algo in model.items():  # This line is corrected
+            for algo_name, algo in model.items():
                 model_start = datetime.now()
                 clf = algo()
                 clf.fit(inputs_train, obj_train)
