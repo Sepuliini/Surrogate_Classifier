@@ -1,11 +1,13 @@
+#!/usr/bin/env python3
 
 import numpy as np
 import pandas as pd
 from os import getcwd, listdir, path, makedirs
 from datetime import datetime
 import logging
+import argparse
 from sklearn.model_selection import train_test_split as tts
-from sklearn.metrics import r2_score
+from sklearn.metrics import r2_score, mean_squared_error
 from sklearn import ensemble, svm
 from sklearn.linear_model import SGDRegressor as SGD
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -13,36 +15,33 @@ from sklearn.neighbors import KNeighborsRegressor as KNR
 from sklearn.tree import DecisionTreeRegressor as DTR
 from sklearn.neural_network import MLPRegressor
 from xgboost import XGBRegressor
-import random
+from desdeo_problem import Variable, ScalarObjective, MOProblem
+from desdeo_emo.EAs.NSGAIII import NSGAIII
+
+# Suppress specific warnings
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # Setup logging
-log_dir = path.join(getcwd(), "logs")
+base_folder = getcwd()
+log_dir = path.join(base_folder, "logs")
 if not path.exists(log_dir):
     makedirs(log_dir)
 log_file = datetime.now().strftime("river_pollution_model_training_%Y-%m-%d_%H-%M-%S.log")
-logging.basicConfig(filename=path.join(log_dir, log_file), level=logging.INFO, 
+logging.basicConfig(filename=path.join(log_dir, log_file), level=logging.INFO,
                     format='%(asctime)s %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
-logging.captureWarnings(True)
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description='Run river pollution model training and optimization')
+parser.add_argument('--data-dir', type=str, required=True, help='Path to the data directory')
+parser.add_argument('--output-dir', type=str, required=True, help='Path to the output directory')
+args = parser.parse_args()
 
-# Start timing the script
-script_start = datetime.now()
-
-# Option to use the full dataset or a subset for testing
-use_full_dataset = False  # Change to True to run on the entire dataset
-
-# Folder paths
-base_folder = getcwd()
-data_folder = path.join(base_folder, "data", "river_pollution_problem")
-output_folder = path.join(base_folder, "modelling_results")
-
-# Ensure the output folder exists
-if not path.exists(output_folder):
-    makedirs(output_folder)
+data_dir = args.data_dir
+output_dir = args.output_dir
 
 # Define surrogate modeling techniques
-algorithms = ["SVM", "NN", "Ada", "GPR", "SGD", "KNR", "DTR", "RFR", "ExTR", "GBR", "XGB"]
-model = {
+algorithms = {
     "SVM": svm.SVR,
     "NN": MLPRegressor,
     "Ada": ensemble.AdaBoostRegressor,
@@ -53,52 +52,59 @@ model = {
     "RFR": ensemble.RandomForestRegressor,
     "ExTR": ensemble.ExtraTreesRegressor,
     "GBR": ensemble.GradientBoostingRegressor,
-    "XGB": XGBRegressor 
+    "XGB": XGBRegressor
 }
 
-# Initialize R2results DataFrame outside the main loop
-columns = ['File', 'Model', 'Objective', 'R2_Score']
+# Initialize an empty DataFrame to store R² and MSE results
+columns = ['File', 'Model', 'Objective', 'R2_Score', 'MSE']
 R2results = pd.DataFrame(columns=columns)
 
-# Collecting files and optionally selecting a subset
-files = [f for f in listdir(data_folder) if f.endswith('.csv')]
-selected_files = random.sample(files, int(len(files) * 0.1)) if not use_full_dataset else files
+# List all files in the data directory
+files = [f for f in listdir(data_dir) if f.endswith('.csv')]
 
-# Process each dataset
-for file in selected_files:
-    fullfilename = path.join(data_folder, file)
-    logging.info(f"Processing file: {fullfilename}")
+# Process each file
+for file in files:
+    data = pd.read_csv(path.join(data_dir, file))
+    feature_columns = [col for col in data.columns if col.startswith('x_')]
+    objective_columns = [col for col in data.columns if col.startswith('f_')]
+    num_vars = len(feature_columns)
+    num_obj = len(objective_columns)
 
-    data = pd.read_csv(fullfilename)
-    inputs = data.iloc[:, :-5] 
-    for i in range(1, 6):
-        objective = f'f_{i}'
-        y = data[objective]
-        inputs_train, inputs_test, y_train, y_test = tts(inputs, y, test_size=0.3, random_state=42)
+    logging.info(f"Processing file {file} with {num_vars} features and {num_obj} objectives.")
 
-        for algo_name, algo_class in model.items():  # Corrected line
-            model_start = datetime.now()
-            clf = algo_class()  # Instantiate the model
-            clf.fit(inputs_train, y_train)
-            y_pred = clf.predict(inputs_test)
-            score = r2_score(y_test, y_pred)
+    models = []
+    for objective_index, obj_col in enumerate(objective_columns):
+        target = data[obj_col]
+        X_train, X_test, y_train, y_test = tts(inputs, target, test_size=0.3, random_state=42)
+        for algo_name, algo in algorithms.items():
+            clf = algo()
+            clf.fit(X_train, y_train)
+            y_pred = clf.predict(X_test)
+            r2 = r2_score(y_test, y_pred)
+            mse = mean_squared_error(y_test, y_pred)
+            R2results.loc[len(R2results)] = [file, algo_name, obj_col, r2, mse]
+            models.append(clf)
+            logging.info(f"Trained {algo_name} for objective {obj_col} with R2: {r2}, MSE: {mse}")
 
-            model_end = datetime.now()
-            training_duration = (model_end - model_start).total_seconds()
-            logging.info(f"Trained {algo_name} on {objective} in {training_duration:.2f} seconds with R^2 score: {score}")
+    # Log number of trained models for objectives
+    logging.info(f"Trained models for {num_obj} objectives from file {file}.")
 
-            R2results = R2results.append({
-                'File': file, 
-                'Model': algo_name, 
-                'Objective': objective, 
-                'R2_Score': score
-            }, ignore_index=True)
+    # Optimization for each model
+    for model, obj_col in zip(models, objective_columns):
+        variables = [Variable(f"x{i+1}", lower_bound=0.1, upper_bound=1.0) for i in range(num_vars)]
+        objectives = [ScalarObjective(name=obj_col, evaluator=(lambda x, m=model: m.predict(np.atleast_2d(x)).flatten()))]
+        problem = MOProblem(variables=variables, objectives=objectives, constraints=[])
 
-# Save R^2 results to CSV 
-R2results_filename = path.join(output_folder, "RiverPollution_R2_Results.csv")
+        ea = NSGAIII(problem, n_iterations=10, n_gen_per_iter=50)
+        ea.solve()
+        solutions = ea.end()[1]
+        results_df = pd.DataFrame(solutions, columns=[obj_col])
+        
+        results_filename = path.join(output_dir, f"{file[:-4]}_{obj_col}_optimization_results.csv")
+        results_df.to_csv(results_filename, index=False)
+        logging.info(f"Optimization results for objective {obj_col} saved to {results_filename}")
+
+# Save and log R² and MSE results
+R2results_filename = path.join(output_dir, "R2_MSE_Results.csv")
 R2results.to_csv(R2results_filename, index=False)
-logging.info("Surrogate modeling for River Pollution problem completed.")
-
-script_end = datetime.now()
-elapsed_time = (script_end - script_start).total_seconds()
-logging.info(f"Script finished in {elapsed_time:.2f} seconds.")
+logging.info("All R² and MSE results saved and script completed successfully.")
