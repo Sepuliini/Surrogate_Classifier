@@ -26,7 +26,7 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message=".*X does not have valid feature names.*")
 
 # Setup logging
-base_folder = '/scratch/project_2010752'
+base_folder = '/scratch/project_2011092'
 log_dir = path.join(base_folder, "logs")
 if not path.exists(log_dir):
     makedirs(log_dir)
@@ -76,7 +76,7 @@ R2results = pd.DataFrame(columns=["Problem", "Model", "Objective", "R2_Score", "
 files = listdir(data_dir)
 
 # Option to use the full dataset or a subset
-use_full_dataset = False  # Set to True to use the full dataset
+use_full_dataset = True  # Set to True to use the full dataset
 selected_files = files if use_full_dataset else random.sample(files, min(len(files), 1)) if files else []
 
 print(f"Script started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -101,17 +101,25 @@ def train_models_for_file(file, algo):
         return None, None, None, None  # Skipping this file
 
     try:
-        data = pd.read_csv(path.join(data_dir, file))  # Load dataset
-        #Change this!!
-        inputs = data.iloc[:, :-2]  # Assumes last two columns are objectives
-        num_vars = inputs.shape[1]
-        num_obj = len(data.columns) - num_vars
+        # Load dataset
+        data = pd.read_csv(path.join(data_dir, file))  
+        
+        # Identify objective columns (those starting with 'f_')
+        objective_columns = [col for col in data.columns if col.startswith('f_')]
+        input_columns = [col for col in data.columns if not col.startswith('f_')]
+        
+        inputs = data[input_columns]  # Input variables (x_1, x_2, etc.)
+        num_vars = inputs.shape[1]  # Number of variables
+        num_obj = len(objective_columns)  # Number of objectives (f_1, f_2, etc.)
+        sample_size = len(data)  # Get sample size from the dataset
         
         trained_models = []
-        for objective_index in range(num_obj):
-            target = data.iloc[:, -(objective_index+1)]
+        
+        for objective_index, obj_col in enumerate(objective_columns):
+            target = data[obj_col]  # Target is the current objective column (f_1, f_2, etc.)
             X_train, X_test, y_train, y_test = tts(inputs, target, test_size=0.3, random_state=42)
 
+            # Train the model using the selected algorithm
             clf = algo()
             clf.fit(X_train, y_train)
             y_pred = clf.predict(X_test)
@@ -120,21 +128,29 @@ def train_models_for_file(file, algo):
             mse = mean_squared_error(y_test, y_pred)
 
             # Save R² and MSE results
-            R2results.loc[len(R2results)] = [problem_name, algo.__name__, f"f{objective_index + 1}", r2, mse]
+            R2results.loc[len(R2results)] = [problem_name, algo.__name__, obj_col, r2, mse]
 
             trained_models.append(clf)
 
         logging.info(f"{file} [success] - models trained successfully.")
-        return trained_models, problem_name, num_vars, num_obj
+        return trained_models, problem_name, num_vars, num_obj, sample_size
 
     except Exception as e:
         logging.error(f"{file} [failed] - error during model training: {str(e)}")
         return None, None, None, None  # Skipping this file
 
-def optimization_part(models, problem_name, algorithm_name, num_vars, num_obj, output_dir):
+
+def optimization_part(models, problem_name, algorithm_name, num_vars, num_obj, output_dir, sample_size):
     print(f"Starting optimization with {algorithm_name} for problem {problem_name}.")
     logging.info(f"Starting optimization for {algorithm_name} on {problem_name}")
+    
     try:
+        # Get the corresponding problem function based on problem name (re21, re22, etc.)
+        problem_function = problem_mapping.get(problem_name, None)
+
+        if problem_function is None:
+            raise ValueError(f"No problem function found for {problem_name}")
+
         # Define variables with an initial value
         initial_value = 0.5
         variables = [Variable(f"x_{i+1}", lower_bound=0.1, upper_bound=1.0, initial_value=initial_value) for i in range(num_vars)]
@@ -145,8 +161,11 @@ def optimization_part(models, problem_name, algorithm_name, num_vars, num_obj, o
             for i in range(num_obj)
         ]
 
-        # Setup the optimization problem with surrogate objectives
-        problem = MOProblem(variables=variables, objectives=surrogate_objectives)
+        # Get the problem constraints from the specific problem (e.g., re21().constraints)
+        problem_constraints = problem_function().constraints
+
+        # Setup the optimization problem with surrogate objectives and problem-specific constraints
+        problem = MOProblem(variables=variables, objectives=surrogate_objectives, constraints=problem_constraints)
 
         # Define the common parameters for all EAs
         common_params = {'n_iterations': 10, 'n_gen_per_iter': 50}
@@ -169,14 +188,15 @@ def optimization_part(models, problem_name, algorithm_name, num_vars, num_obj, o
 
             solutions = evolver.end()[1]
             print(f"Optimization complete for {ea_name} on {problem_name}. Saving results...")
-            save_optimization_results(solutions, problem_name, algorithm_name, ea_name, num_obj, output_dir)
+            save_optimization_results(solutions, problem_name, algorithm_name, ea_name, num_obj, output_dir, sample_size)
             logging.info(f"Optimization for {ea_name} on {problem_name} completed successfully.")
 
     except Exception as e:
         logging.error(f"Optimization for {algorithm_name} on {problem_name} [failed] - error: {str(e)}")
 
 
-def save_optimization_results(solutions, problem_name, algorithm_name, ea_name, num_obj, output_dir):
+
+def save_optimization_results(solutions, problem_name, algorithm_name, ea_name, num_obj, output_dir, sample_size):
     # Directly use the provided output_dir for saving results, ensuring it does not repeat folder names
     # Add a subfolder for the problem name to organize results by problem
     optimization_results_dir = path.join(output_dir, problem_name)
@@ -184,24 +204,48 @@ def save_optimization_results(solutions, problem_name, algorithm_name, ea_name, 
     if not path.exists(optimization_results_dir):
         makedirs(optimization_results_dir)
     
-    results_filename = path.join(optimization_results_dir, f"{algorithm_name}_{ea_name}_optimization_results.csv")
+    # Include sample size in the file name
+    results_filename = path.join(optimization_results_dir, f"{algorithm_name}_{ea_name}_{sample_size}samples_optimization_results.csv")
+    
     solutions_df = pd.DataFrame(solutions, columns=[f"f{i+1}" for i in range(num_obj)])
     solutions_df.to_csv(results_filename, index=False)
     print(f"Optimization results for {ea_name} saved to {results_filename}")
     logging.info(f"Optimization results for {ea_name} saved to {results_filename}")
 
 
+
+# Load list of already processed files
+processed_files_log = path.join(output_dir, "processed_files.csv")
+if path.exists(processed_files_log):
+    processed_files_df = pd.read_csv(processed_files_log)
+    processed_files = set(processed_files_df["File"].tolist())
+else:
+    processed_files = set()
+
+# Function to append processed file to the log
+def log_processed_file(file):
+    with open(processed_files_log, "a") as log_file:
+        log_file.write(f"{file}\n")
+
 # Iterate over selected files
 for file in selected_files:
+    if file in processed_files:
+        print(f"Skipping file {file}, already processed.")
+        continue  # Skip already processed files
+
     print(f"\nProcessing file: {file}")
     problem_name = extract_details_from_filename(file)
     if problem_name is None:
         continue  # Skip the file if details cannot be extracted
 
     for algo_name, algo in model.items():
-        models, problem_name, num_vars, num_obj = train_models_for_file(file, algo)
+        models, problem_name, num_vars, num_obj, sample_size = train_models_for_file(file, algo)
         if models and problem_name and num_vars is not None and num_obj is not None:
-            optimization_part(models, problem_name, algo_name, num_vars, num_obj, output_dir)
+            optimization_part(models, problem_name, algo_name, num_vars, num_obj, output_dir, sample_size)
+    
+    # Log the processed file
+    log_processed_file(file)
+
 
 # Save the R² and MSE results to a CSV file
 r2_results_filename = path.join(output_dir, "R2_MSE_results.csv")
