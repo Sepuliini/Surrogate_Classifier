@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=surrogates_parallel         # Job name
 #SBATCH --account=project_2011092              # Project account
-#SBATCH --partition=small                      # Partition (queue)
+#SBATCH --partition=longrun                      # Partition (queue)
 #SBATCH --cpus-per-task=10                     # Number of CPU cores per task
 #SBATCH --mem=16G                              # Memory per node
-#SBATCH --time=02:00:00                        # Set wall-clock time to 2 hours (adjust as needed)
+#SBATCH --time=time=14-00:00:00                 # Set wall-clock time to 2 hours (adjust as needed)
 #SBATCH --output=/projappl/project_2011092/err_logs/surrogates_%A_%a.out  # Standard output file for all tasks
 #SBATCH --error=/projappl/project_2011092/err_logs/surrogates_%A_%a.err   # Standard error file for all tasks
 #SBATCH --array=1-7                            # Array indices for all tasks (now 1 to 6)
