@@ -32,7 +32,7 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message=".*X does not have valid feature names.*")
 
 # Setup logging
-base_folder = '/scratch/project_2010752'
+base_folder = '/scratch/project_2011092'
 log_dir = path.join(base_folder, "logs")
 if not path.exists(log_dir):
     makedirs(log_dir)
@@ -80,7 +80,7 @@ R2results = pd.DataFrame(columns=["File", "Model", "Objective", "R2_Score", "MSE
 files = listdir(inner_data_folder)
 
 # Set this to False if you want to select a subset of files
-use_full_dataset = False
+use_full_dataset = True
 
 # Select exactly one file if not using the full dataset
 if not use_full_dataset:
@@ -218,8 +218,25 @@ def save_optimization_results(solutions, problem_name, algorithm_name, ea_name, 
     logging.info(f"Optimization results for {ea_name} saved to {results_filename}")
 
 
+# Load list of already processed files
+processed_files_log = path.join(output_folder, "processed_files.csv")
+if path.exists(processed_files_log):
+    processed_files_df = pd.read_csv(processed_files_log)
+    processed_files = set(processed_files_df["File"].tolist())
+else:
+    processed_files = set()
+
+# Function to append processed file to the log
+def log_processed_file(file):
+    with open(processed_files_log, "a") as log_file:
+        log_file.write(f"{file}\n")
+
 # Iterate over selected files
 for file in selected_files:
+    if file in processed_files:
+        print(f"Skipping file {file}, already processed.")
+        continue  # Skip already processed files
+
     print(f"\nProcessing file: {file}")
     problem_name, num_vars, num_obj, num_samples = extract_details_from_filename(file)
     if problem_name is None:
@@ -229,6 +246,10 @@ for file in selected_files:
         models, problem_name, num_vars, num_obj, num_samples = train_models_for_file(file, algo)
         if models:
             optimization_part(models, problem_name, algo_name, num_vars, num_obj, num_samples, output_folder)
+
+    # Log the processed file
+    log_processed_file(file)
+
 
 # Save R² and MSE results
 R2results_filename = path.join(output_folder, "DTLZ_R2_MSE_Results.csv")
