@@ -1,98 +1,240 @@
+#!/usr/bin/env python3
+
 import numpy as np
 import pandas as pd
-from os import getcwd, listdir, path, makedirs
-import pickle
+from os import path, makedirs, listdir
+from datetime import datetime
+import logging
+import random
+import argparse
+import re
+from sklearn.model_selection import train_test_split as tts
+from sklearn.metrics import r2_score, mean_squared_error
 from sklearn import ensemble, svm
 from sklearn.linear_model import SGDRegressor as SGD
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.neighbors import KNeighborsRegressor as KNR
 from sklearn.tree import DecisionTreeRegressor as DTR
-from sklearn.metrics import r2_score
-from sklearn.model_selection import train_test_split as tts
 from sklearn.neural_network import MLPRegressor
 from xgboost import XGBRegressor
-import random
-from datetime import datetime
-import logging
+from desdeo_problem import Variable, ScalarObjective, MOProblem
+from desdeo_emo.EAs import NSGAIII, IBEA, RVEA
 import warnings
 
+# Suppress specific warnings
+warnings.filterwarnings("ignore", category=UserWarning, message=".*X does not have valid feature names.*")
+
 # Setup logging
-log_dir = path.join(getcwd(), "logs")
+base_folder = '/scratch/project_2011092'
+log_dir = path.join(base_folder, "logs")
 if not path.exists(log_dir):
     makedirs(log_dir)
 log_file = datetime.now().strftime("vehicle_crashworthiness_model_training_%Y-%m-%d_%H-%M-%S.log")
-logging.basicConfig(filename=path.join(log_dir, log_file), level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-logging.captureWarnings(True)
+logging.basicConfig(filename=path.join(log_dir, log_file), level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
-# Start timing the script
-script_start = datetime.now()
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description='Run Vehicle Crashworthiness surrogates')
+parser.add_argument('--data_dir', type=str, required=True, help='Path to the data directory')
+parser.add_argument('--output_dir', type=str, required=True, help='Path to the output directory')
+args = parser.parse_args()
 
-# Folder paths
-base_folder = getcwd()
-data_folder = path.join(base_folder, "data", "vehicle_crashworthiness")
-output_folder = path.join(base_folder, "modelling_results")
-
-# Ensure the output folder exists
-if not path.exists(output_folder):
-    makedirs(output_folder)
+data_dir = args.data_dir
+output_dir = args.output_dir
 
 # Define surrogate modeling techniques
-models = {
-    "SVM": svm.SVR(),
-    "NN": MLPRegressor(),
-    "Ada": ensemble.AdaBoostRegressor(),
-    "GPR": GaussianProcessRegressor(),
-    "SGD": SGD(),
-    "KNR": KNR(),
-    "DTR": DTR(),
-    "RFR": ensemble.RandomForestRegressor(),
-    "ExTR": ensemble.ExtraTreesRegressor(),
-    "GBR": ensemble.GradientBoostingRegressor(),
-    "XGB": XGBRegressor()
+model = {
+    "SVM": svm.SVR,
+    "NN": MLPRegressor,
+    "Ada": ensemble.AdaBoostRegressor,
+    "GPR": GaussianProcessRegressor,
+    "SGD": SGD,
+    "KNR": KNR,
+    "DTR": DTR,
+    "RFR": ensemble.RandomForestRegressor,
+    "ExTR": ensemble.ExtraTreesRegressor,
+    "GBR": ensemble.GradientBoostingRegressor,
+    "XGB": XGBRegressor
 }
 
-# Option to use the full dataset or a subset for testing
-use_full_dataset = False  # Change to True to run on the entire dataset
+# Initialize an empty DataFrame to store R² and MSE results
+R2results = pd.DataFrame(columns=["Model", "Objective", "R2_Score", "MSE"])
 
-# Initialize R2results DataFrame outside the main loop
-columns = ['File', 'Model', 'Objective', 'R2_Score']
-R2results = pd.DataFrame(columns=columns)
+# List all files in the data directory
+files = listdir(data_dir)
 
-# Collecting files and optionally selecting a subset
-files = [f for f in listdir(data_folder) if f.endswith('.csv')]
-selected_files = random.sample(files, int(len(files) * 0.1)) if not use_full_dataset else files
+# Option to use the full dataset or a subset
+use_full_dataset = True  # Set to True to use the full dataset
+selected_files = files if use_full_dataset else random.sample(files, min(len(files), 1)) if files else []
 
-# Process each dataset
+print(f"Script started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"Found {len(files)} files in the dataset folder: {'Full dataset' if use_full_dataset else 'Selected subset'}")
+
+def extract_details_from_filename(filename):
+    pattern = re.compile(r"(vehicle_crashworthiness)_(\d+)_samples\.csv")
+    match = pattern.match(filename)
+    if match:
+        problem_name = match.group(1)
+        sample_size = match.group(2)
+        return problem_name, sample_size
+    else:
+        logging.error(f"Filename {filename} does not match the expected pattern.")
+        return None, None
+
+def train_models_for_file(file, algo):
+    print(f"Processing file: {file}")
+    problem_name, sample_size = extract_details_from_filename(file)
+    if not problem_name:
+        print(f"Skipping file {file}, unable to extract details.")
+        logging.info(f"{file} [failed] - unable to extract details.")
+        return None, None, None, None  # Skipping this file
+
+    try:
+        # Load dataset
+        data = pd.read_csv(path.join(data_dir, file))  
+        logging.info(f"Data shape: {data.shape}")
+
+        # Identify objective columns (those starting with 'f')
+        objective_columns = [col for col in data.columns if col.startswith('f')]
+        # Identify input columns (those starting with 'x')
+        input_columns = [col for col in data.columns if col.startswith('x')]
+
+        # Log how many input and objective columns were found
+        logging.info(f"Found {len(input_columns)} input columns and {len(objective_columns)} objective columns")
+
+        if len(objective_columns) == 0:
+            logging.error(f"No objective columns found in {file}. Skipping file.")
+            return None, None, None
+
+        inputs = data[input_columns]  # Input variables (x1, x2, etc.)
+        num_vars = inputs.shape[1]  # Number of variables
+        num_obj = len(objective_columns)  # Number of objectives (f1, f2, etc.)
+
+        trained_models = []
+        
+        for objective_index, obj_col in enumerate(objective_columns):
+            target = data[obj_col]  # Target is the current objective column (f1, f2, etc.)
+            X_train, X_test, y_train, y_test = tts(inputs, target, test_size=0.3, random_state=42)
+
+            # Train the model using the selected algorithm
+            clf = algo()
+            clf.fit(X_train, y_train)
+            y_pred = clf.predict(X_test)
+
+            r2 = r2_score(y_test, y_pred)
+            mse = mean_squared_error(y_test, y_pred)
+
+            logging.info(f"Trained model for {obj_col} using {algo.__name__}, R²: {r2:.4f}, MSE: {mse:.4f}")
+
+            # Save R² and MSE results
+            R2results.loc[len(R2results)] = [algo.__name__, obj_col, r2, mse]
+
+            trained_models.append(clf)
+
+        logging.info(f"{file} [success] - models trained successfully.")
+        return trained_models, num_vars, num_obj, sample_size
+
+    except Exception as e:
+        logging.error(f"{file} [failed] - error during model training: {str(e)}")
+        return None, None, None, None  # Skipping this file
+
+def optimization_part(models, num_vars, num_obj, output_dir, sample_size):
+    print(f"Starting optimization for Vehicle Crashworthiness.")
+    logging.info(f"Starting optimization for Vehicle Crashworthiness")
+
+    try:
+        # Define variables with an initial value
+        initial_value = 0.5
+        variables = [Variable(f"x_{i+1}", lower_bound=0.1, upper_bound=1.0, initial_value=initial_value) for i in range(num_vars)]
+
+        # Use surrogate models as objective functions
+        surrogate_objectives = [
+            ScalarObjective(name=f'f{i+1}', evaluator=lambda x, m=models[i]: m.predict(np.atleast_2d(x)).flatten())
+            for i in range(num_obj)
+        ]
+
+        # Setup the optimization problem with surrogate objectives
+        problem = MOProblem(variables=variables, objectives=surrogate_objectives)
+
+        # Define the common parameters for all EAs
+        common_params = {'n_iterations': 10, 'n_gen_per_iter': 50}
+
+        # Optimization algorithms to use with their specific additional parameters
+        eas = {
+            "NSGAIII": (NSGAIII, {}),
+            "IBEA": (IBEA, {'population_size': 100}),
+            "RVEA": (RVEA, {'population_size': 100})
+        }
+
+        for ea_name, (ea, ea_specific_params) in eas.items():
+            print(f"\nRunning {ea_name} for Vehicle Crashworthiness.")
+            logging.info(f"\nStarting {ea_name} optimization for Vehicle Crashworthiness")
+
+            evolver = ea(problem, **{**common_params, **ea_specific_params})
+
+            while evolver.continue_evolution():
+                evolver.iterate()
+
+            solutions = evolver.end()[1]
+            print(f"Optimization complete for {ea_name}. Saving results...")
+            save_optimization_results(solutions, ea_name, num_obj, output_dir, sample_size)
+            logging.info(f"Optimization for {ea_name} completed successfully.")
+
+    except Exception as e:
+        logging.error(f"Optimization for Vehicle Crashworthiness [failed] - error: {str(e)}")
+
+
+def save_optimization_results(solutions, ea_name, num_obj, output_dir, sample_size):
+    # Save results in the specified output directory
+    optimization_results_dir = path.join(output_dir, "vehicle_crashworthiness")
+    
+    if not path.exists(optimization_results_dir):
+        makedirs(optimization_results_dir)
+    
+    # Include sample size in the filename
+    results_filename = path.join(optimization_results_dir, f"{ea_name}_{sample_size}samples_optimization_results.csv")
+    
+    solutions_df = pd.DataFrame(solutions, columns=[f"f{i+1}" for i in range(num_obj)])
+    solutions_df.to_csv(results_filename, index=False)
+    print(f"Optimization results for {ea_name} saved to {results_filename}")
+    logging.info(f"Optimization results for {ea_name} saved to {results_filename}")
+
+
+# Load list of already processed files
+processed_files_log = path.join(output_dir, "processed_files.csv")
+if path.exists(processed_files_log):
+    processed_files_df = pd.read_csv(processed_files_log)
+    processed_files = set(processed_files_df["File"].tolist())
+else:
+    processed_files = set()
+
+# Function to append processed file to the log
+def log_processed_file(file):
+    with open(processed_files_log, "a") as log_file:
+        log_file.write(f"{file}\n")
+
+# Iterate over selected files
 for file in selected_files:
-    fullfilename = path.join(data_folder, file)
-    logging.info(f"Processing file: {fullfilename}")
+    if file in processed_files:
+        print(f"Skipping file {file}, already processed.")
+        continue  # Skip already processed files
 
-    data = pd.read_csv(fullfilename)
-    num_objectives = 3 
-    objectives_columns = data.columns[-num_objectives:]
-    inputs = data.iloc[:, :-num_objectives]  # Exclude objective columns from inputs
+    print(f"\nProcessing file: {file}")
 
-    for objective in objectives_columns:
-        y = data[objective]
-        inputs_train, inputs_test, y_train, y_test = tts(inputs, y, test_size=0.3, random_state=42)
+    for algo_name, algo in model.items():
+        models, num_vars, num_obj, sample_size = train_models_for_file(file, algo)
+        if models and num_vars is not None and num_obj is not None:
+            optimization_part(models, num_vars, num_obj, output_dir, sample_size)
+    
+    # Log the processed file
+    log_processed_file(file)
 
-        for algo_name, algo in models.items():
-            model_start = datetime.now()
-            algo.fit(inputs_train, y_train)
-            y_pred = algo.predict(inputs_test)
-            score = r2_score(y_test, y_pred)
+# Save the R² and MSE results to a CSV file
+r2_results_filename = path.join(output_dir, "vehicle_crashworthiness_R2_MSE_results.csv")
+R2results.to_csv(r2_results_filename, index=False)
+print(f"R² and MSE results saved to {r2_results_filename}")
+logging.info(f"R² and MSE results saved to {r2_results_filename}")
 
-            model_end = datetime.now()
-            training_duration = (model_end - model_start).total_seconds()
-            logging.info(f"Trained {algo_name} on {objective} in {training_duration:.2f} seconds with R^2 score: {score}")
-
-            R2results = R2results.append({'File': file, 'Model': algo_name, 'Objective': objective, 'R2_Score': score}, ignore_index=True)
-
-# Save R^2 results to CSV
-R2results_filename = path.join(output_folder, "VehicleCrashworthiness_R2_Results.csv")
-R2results.to_csv(R2results_filename, index=False)
-logging.info("Surrogate modeling for Vehicle Crashworthiness problem completed.")
-
+# End timing the script
 script_end = datetime.now()
-elapsed_time = (script_end - script_start).total_seconds()
-logging.info(f"Script finished in {elapsed_time:.2f} seconds.")
+print(f"Script ended at {script_end.strftime('%Y-%m-%d %H:%M:%S')}")
+logging.info(f"Script ended at {script_end.strftime('%Y-%m-%d %H:%M:%S')}")
