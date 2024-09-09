@@ -7,7 +7,7 @@
 #SBATCH --time=time=14-00:00:00                 # Set wall-clock time to 2 hours (adjust as needed)
 #SBATCH --output=/projappl/project_2011092/err_logs/surrogates_%A_%a.out  # Standard output file for all tasks
 #SBATCH --error=/projappl/project_2011092/err_logs/surrogates_%A_%a.err   # Standard error file for all tasks
-#SBATCH --array=1-7                            # Array indices for all tasks (now 1 to 6)
+#SBATCH --array=1-7                            # Array indices for all tasks (now 1 to 7)
 
 # Load necessary modules
 module load python-data
