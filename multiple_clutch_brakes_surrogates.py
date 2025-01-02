@@ -30,7 +30,7 @@ from desdeo_emo.EAs.RVEA import RVEA
 warnings.filterwarnings("ignore", category=UserWarning, message=".*X does not have valid feature names.*")
 
 # Setup logging
-base_folder = '/scratch/project_2011092'
+base_folder = '/scratch/project_2012636'
 log_dir = path.join(base_folder, "logs")
 if not path.exists(log_dir):
     makedirs(log_dir)
