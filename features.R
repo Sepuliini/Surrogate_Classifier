@@ -1,14 +1,14 @@
 # Set the custom library path explicitly in the R script
-.libPaths("/projappl/project_2011092/rpackages")
+.libPaths("/projappl/project_2012636/rpackages")
 
 # Now load the flacco library
 library(flacco)
 
 # Define the root folder where your data is stored
-root_folder = '/scratch/project_2011092/Data'
+root_folder = '/scratch/project_2012636/Data'
 
 # Define the output directory and the tracking file
-output_dir = '/scratch/project_2011092/modelling_results'
+output_dir = '/scratch/project_2012636/modelling_results'
 tracking_file = file.path(output_dir, 'processed_files_R.csv')
 
 # List all subfolders within the root directory
