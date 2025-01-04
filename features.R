@@ -102,8 +102,10 @@ for (folder in folders) {
         stringsAsFactors = FALSE
       )
 
+      # Initialize a non-empty data frame to avoid binding issues
+      combined_sets_df = data.frame(dummy_col = NA)
+
       # Calculate each feature set and check for empty results
-      combined_sets_df = data.frame()
       for (fs_name in calc_feature_sets) {
         cat("  Calculating set:", fs_name, "for", out_name, "\n")
         tmp = tryCatch({
@@ -115,13 +117,16 @@ for (folder in folders) {
         })
 
         # Only add features if non-empty and matching row counts
-        if (nrow(tmp) > 0 && ncol(tmp) > 0 && nrow(tmp) == nrow(one_row)) {
+        if (nrow(tmp) > 0 && ncol(tmp) > 0) {
           colnames(tmp) = paste0(fs_name, "_", colnames(tmp))
           combined_sets_df = cbind(combined_sets_df, tmp)
         } else {
-          cat("  Skipping feature set due to row count mismatch or empty results: ", fs_name, "\n")
+          cat("  Skipping feature set due to empty results: ", fs_name, "\n")
         }
       }
+
+      # Remove the placeholder column if it still exists
+      combined_sets_df = combined_sets_df[ , !colnames(combined_sets_df) %in% c("dummy_col")]
 
       # Bind the combined features to the identifying columns if data exists
       if (ncol(combined_sets_df) > 0) {
