@@ -14,12 +14,11 @@ from desdeo_problem.testproblems.CarSideImpact import car_side_impact
 from desdeo_problem.testproblems.VehicleCrashworthiness import vehicle_crashworthiness
 from desdeo_problem.testproblems.RiverPollution import river_pollution_problem
 
-
 # Engineering problems mapping
 problem_mapping = {
     "multiple_clutch_brakes": multiple_clutch_brakes,
     "car_side_impact": car_side_impact,
-    "vehicle_crashworthniess": vehicle_crashworthiness,
+    "vehicle_crashworthiness": vehicle_crashworthiness,
     "river_pollution_problem": river_pollution_problem,
     "re21": re21,
     "re22": re22,
@@ -31,8 +30,37 @@ problem_mapping = {
     "re33": re33
 }
 
-# Define necessary input variables
-num_vars = 5
+# Define the number of decision variables and ranges for each problem
+num_vars_mapping = {
+    "multiple_clutch_brakes": 5,
+    "car_side_impact": 7,
+    "vehicle_crashworthiness": 5,
+    "river_pollution_problem": 2,
+    "re21": 4,
+    "re22": 3,
+    "re23": 4,
+    "re24": 2,
+    "re25": 3,
+    "re31": 3,
+    "re32": 4,
+    "re33": 4
+}
+
+variable_ranges = {
+    "multiple_clutch_brakes": [(55, 80), (75, 110), (1.5, 3), (300, 1000), (2, 10)],
+    "car_side_impact": [(0.5, 1.5), (0.45, 1.35), (0.5, 1.5), (0.5, 1.5), (0.875, 2.625), (0.4, 1.2), (0.4, 1.2)],
+    "river_pollution_problem": [(0.3, 1.0), (0.3, 1.0)],
+    "vehicle_crashworthiness": [(1.0, 3.0)] * 5,
+    "re21": [(0.1, 1.0)] * 4,
+    "re22": [(0.2, 15), (0, 20), (0, 40)],
+    "re23": [(1, 100), (1, 100), (10, 200), (10, 240)],
+    "re24": [(0.5, 4), (4, 50)],
+    "re25": [(1, 70), (0.6, 30), (0.009, 0.5)],
+    "re31": [(0.00001, 100), (0.00001, 100), (1.0, 3.0)],
+    "re32": [(0.125, 5), (0.1, 10), (0.1, 10), (0.125, 5)],
+    "re33": [(55, 80), (75, 110), (1000, 3000), (11, 20)]
+}
+
 output_dir = "/scratch/project_2012636/modelling_results/real_paretofronts"
 sample_size = 100
 algorithm_name = "desdeo_ea"
@@ -49,7 +77,6 @@ eas = {
     "RVEA": (RVEA, {'population_size': 500})
 }
 
-# Function to check if a solution dominates another
 import numba
 @numba.njit()
 def dominates(x, y):
@@ -78,17 +105,13 @@ def non_dominated(data):
                 break
     return index
 
-# Function to remove dominated solutions and save results
 def save_optimization_results(solutions, problem_name, algorithm_name, output_dir):
     num_obj = solutions.shape[1]
-    # Remove dominated solutions
     non_dominated_indices = non_dominated(solutions)
     non_dominated_solutions = solutions[non_dominated_indices]
 
     filename = f"{problem_name}_combined_real_paretofront.csv"
     file_path = os.path.join(output_dir, filename)
-    
-    # Convert solutions to a DataFrame for easier saving
     df = pd.DataFrame(non_dominated_solutions, columns=[f"obj_{i+1}" for i in range(num_obj)])
     df.to_csv(file_path, index=False)
     print(f"Results saved to {file_path}")
@@ -96,10 +119,11 @@ def save_optimization_results(solutions, problem_name, algorithm_name, output_di
 # Loop through each problem and run the optimization loop
 for problem_name, problem_function in problem_mapping.items():
     print(f"Processing problem: {problem_name}")
+    num_vars = num_vars_mapping[problem_name]
+    var_ranges = variable_ranges[problem_name]
 
-    # Define variables with an initial value
-    initial_value = 0.5
-    variables = [Variable(f"x_{i+1}", lower_bound=0.1, upper_bound=1.0, initial_value=initial_value) for i in range(num_vars)]
+    # Define variables with specified ranges
+    variables = [Variable(f"x_{i+1}", lower_bound=lb, upper_bound=ub, initial_value=(lb + ub) / 2) for i, (lb, ub) in enumerate(var_ranges)]
 
     # Instantiate the engineering problem
     problem = problem_function()
@@ -114,13 +138,10 @@ for problem_name, problem_function in problem_mapping.items():
 
         while evolver.continue_evolution():
             evolver.iterate()
-            # Collect solutions at each generation
             all_solutions.append(evolver.population.objectives)
 
-        # Flatten all collected solutions across generations
         all_solutions = np.vstack(all_solutions)
         combined_solutions.append(all_solutions)
 
-    # Combine solutions from both algorithms and filter non-dominated solutions
     combined_solutions = np.vstack(combined_solutions)
     save_optimization_results(combined_solutions, problem_name, algorithm_name, output_dir)
