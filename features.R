@@ -1,158 +1,147 @@
-# Set the custom library path explicitly in the R script
-.libPaths("/projappl/project_2012636/rpackages")
+#!/usr/bin/env python3
 
-# Load the flacco library
-library(flacco)
+import numpy as np
+import os
+import pandas as pd
+from desdeo_problem.problem.Variable import Variable
+from desdeo_problem.problem.Objective import ScalarObjective
+from desdeo_problem.problem.Problem import MOProblem
+from desdeo_problem import ScalarConstraint
+from desdeo_emo.EAs import NSGAIII, RVEA
+from desdeo_problem.testproblems.EngineeringRealWorld import re21, re22, re23, re24, re25, re31, re32, re33
+from desdeo_problem.testproblems.MultipleClutchBrakes import multiple_clutch_brakes
+from desdeo_problem.testproblems.CarSideImpact import car_side_impact
+from desdeo_problem.testproblems.VehicleCrashworthiness import vehicle_crashworthiness
+from desdeo_problem.testproblems.RiverPollution import river_pollution_problem
 
-# Define the root folder where your data is stored
-root_folder   = "/scratch/project_2012636/Data"
-
-# Define the output directory and the tracking file
-output_dir    = "/scratch/project_2012636/modelling_results"
-tracking_file = file.path(output_dir, "processed_files_R.csv")
-output_csv = file.path(output_dir, "features.csv")
-
-# List all subfolders within the root directory
-folders = list.dirs(root_folder, recursive = TRUE)
-
-# Function to clean column names (handles cases like 'x_1' vs 'x1')
-clean_column_names <- function(cnames) {
-  gsub("x_", "x", cnames)  # Replaces 'x_' with 'x'
+# Engineering problems mapping
+problem_mapping = {
+    "multiple_clutch_brakes": multiple_clutch_brakes,
+    "car_side_impact": car_side_impact,
+    "vehicle_crashworthiness": vehicle_crashworthiness,
+    "river_pollution_problem": river_pollution_problem,
+    "re21": re21,
+    "re22": re22,
+    "re23": re23,
+    "re24": re24,
+    "re25": re25,
+    "re31": re31,
+    "re32": re32,
+    "re33": re33
 }
 
-# Corrected feature sets
-calc_feature_sets = c(
-  # "ela_conv",         # convexity (requires an exact function)
-  # "ela_curv",         # curvature (requires an exact function)
-  # "ela_level",        # levelset (requires an exact function)
-  # "ela_local",        # local search (requires an exact function)
-  "ela_meta",         # metamodel features
-  "ela_distr",        # y-distribution
-  "basic",            # basic features
-  "disp",             # dispersion features
-  "ic",               # information content features
-  "nbc",              # nearest better clustering
-  "pca",              # principal component analysis features
-  "cm_angle"          # corrected from "cma" to "cm_angle" (cell mapping angle features)
-)
-
-# Initialize a final data.frame to store one row per (file + f-column)
-all_features = data.frame()
-
-# Load existing processed files list, considering skipped features
-if (file.exists(tracking_file)) {
-  processed_files_df <- read.csv(tracking_file, stringsAsFactors = FALSE)
-  processed_files <- processed_files_df$file
-} else {
-  processed_files <- character()  # Empty if no tracking file exists
+# Define the number of decision variables and ranges for each problem
+num_vars_mapping = {
+    "multiple_clutch_brakes": 5,
+    "car_side_impact": 7,
+    "vehicle_crashworthiness": 5,
+    "river_pollution_problem": 2,
+    "re21": 4,
+    "re22": 3,
+    "re23": 4,
+    "re24": 2,
+    "re25": 3,
+    "re31": 3,
+    "re32": 4,
+    "re33": 4
 }
 
-# Clear the output CSV to avoid old data
-if (file.exists(output_csv)) {
-  file.remove(output_csv)
+variable_ranges = {
+    "multiple_clutch_brakes": [(55, 80), (75, 110), (1.5, 3), (300, 1000), (2, 10)],
+    "car_side_impact": [(0.5, 1.5), (0.45, 1.35), (0.5, 1.5), (0.5, 1.5), (0.875, 2.625), (0.4, 1.2), (0.4, 1.2)],
+    "river_pollution_problem": [(0.3, 1.0), (0.3, 1.0)],
+    "vehicle_crashworthiness": [(1.0, 3.0)] * 5,
+    "re21": [(0.1, 1.0)] * 4,
+    "re22": [(0.2, 15), (0, 20), (0, 40)],
+    "re23": [(1, 100), (1, 100), (10, 200), (10, 240)],
+    "re24": [(0.5, 4), (4, 50)],
+    "re25": [(1, 70), (0.6, 30), (0.009, 0.5)],
+    "re31": [(0.00001, 100), (0.00001, 100), (1.0, 3.0)],
+    "re32": [(0.125, 5), (0.1, 10), (0.1, 10), (0.125, 5)],
+    "re33": [(55, 80), (75, 110), (1000, 3000), (11, 20)]
 }
 
-# Loop over subfolders
-for (folder in folders) {
-  # Get all .csv files
-  files = list.files(path = folder, full.names = TRUE, pattern = "\\.csv$")
+output_dir = "/scratch/project_2012636/modelling_results/real_paretofronts"
+sample_size = 100
+algorithm_name = "desdeo_ea"
 
-  for (file in files) {
-    # Skip the file if it's already processed
-    if (file %in% processed_files) {
-      cat("Skipping already processed file:", file, "\n")
-      next
-    }
+# Ensure the output directory exists
+os.makedirs(output_dir, exist_ok=True)
 
-    cat("\nProcessing file:", file, "\n")
-    dat = read.csv(file)
-    colnames(dat) = clean_column_names(colnames(dat))
+# Define the common parameters for all EAs (Increased for better Pareto front generation)
+common_params = {'n_iterations': 100, 'n_gen_per_iter': 500}
 
-    num_sample = nrow(dat)
-    num_cols   = ncol(dat)
-    # Check if the file name contains 'uniform'
-    is_uni = as.integer(grepl("uniform", file)) 
-
-    # Identify the input columns (starting with 'x') and output columns (starting with 'f')
-    input_cols  = grep("^x", colnames(dat))
-    output_cols = grep("^f", colnames(dat))
-
-    # Convert inputs to numeric
-    inputs = dat[, input_cols, drop = FALSE]
-    inputs = apply(inputs, 2, as.numeric)
-
-    # Keep track of skipped features
-    skipped_features = c()
-
-    # For each output column, calculate the specified feature sets
-    for (output_col in output_cols) {
-      out_name = colnames(dat)[output_col]
-      outputs  = as.numeric(dat[, output_col])
-
-      # Create FeatureObject
-      feat.object = createFeatureObject(X = inputs, y = outputs)
-
-      # Prepare one-row data frame to collect all features for this (file + f-col)
-      one_row = data.frame(
-        file_name      = file,
-        f_col          = out_name,
-        num_samples    = num_sample,
-        dimensionality = length(input_cols),
-        is_uniform     = is_uni,
-        stringsAsFactors = FALSE
-      )
-
-      # Initialize a non-empty data frame to avoid binding issues
-      combined_sets_df = data.frame(dummy_col = NA)
-
-      # Calculate each feature set and check for empty results
-      for (fs_name in calc_feature_sets) {
-        cat("  Calculating set:", fs_name, "for", out_name, "\n")
-        tmp = tryCatch({
-          data.frame(calculateFeatureSet(feat.object, set = fs_name))
-        }, error = function(e) {
-          cat("  Warning: No features generated for", fs_name, "\n")
-          skipped_features = c(skipped_features, fs_name)
-          return(data.frame())
-        })
-
-        # Only add features if non-empty and matching row counts
-        if (nrow(tmp) > 0 && ncol(tmp) > 0) {
-          colnames(tmp) = paste0(fs_name, "_", colnames(tmp))
-          combined_sets_df = cbind(combined_sets_df, tmp)
-        } else {
-          cat("  Skipping feature set due to empty results: ", fs_name, "\n")
-        }
-      }
-
-      # Remove the placeholder column if it still exists
-      combined_sets_df = combined_sets_df[ , !colnames(combined_sets_df) %in% c("dummy_col")]
-
-      # Bind the combined features to the identifying columns if data exists
-      if (ncol(combined_sets_df) > 0) {
-        one_row = cbind(one_row, combined_sets_df)
-
-        # Save results incrementally after each file is processed
-        if (!file.exists(output_csv)) {
-          write.csv(one_row, file = output_csv, row.names = FALSE)
-        } else {
-          write.table(one_row, file = output_csv, sep = ",", col.names = FALSE, row.names = FALSE, append = TRUE)
-        }
-      } else {
-        cat("  No valid features generated for", out_name, "\n")
-      }
-
-      # Prepare processed file entry including skipped features
-      processed_entry <- data.frame(file = file, skipped_features = paste(skipped_features, collapse = ", "))
-
-      # Log the processed file and skipped features to the tracking file
-      if (!file.exists(tracking_file)) {
-        write.csv(processed_entry, tracking_file, row.names = FALSE)
-      } else {
-        write.table(processed_entry, file = tracking_file, sep = ",", col.names = FALSE, row.names = FALSE, append = TRUE)
-      }
-    }
-  }
+# Optimization algorithms to use with their specific additional parameters (Increased population size)
+eas = {
+    "NSGAIII": (NSGAIII, {'population_size': 500}),
+    "RVEA": (RVEA, {'population_size': 500})
 }
 
-cat("\nAll features have been saved to:", output_csv, "\n")
+import numba
+@numba.njit()
+def dominates(x, y):
+    dom = False
+    for i in range(len(x)):
+        if x[i] > y[i]:
+            return False
+        elif x[i] < y[i]:
+            dom = True
+    return dom
+
+@numba.njit()
+def non_dominated(data):
+    num_solutions = len(data)
+    index = np.zeros(num_solutions, dtype=np.bool_)
+    index[0] = True
+    for i in range(1, num_solutions):
+        index[i] = True
+        for j in range(i):
+            if not index[j]:
+                continue
+            if dominates(data[i], data[j]):
+                index[j] = False
+            elif dominates(data[j], data[i]):
+                index[i] = False
+                break
+    return index
+
+def save_optimization_results(solutions, problem_name, algorithm_name, output_dir):
+    num_obj = solutions.shape[1]
+    non_dominated_indices = non_dominated(solutions)
+    non_dominated_solutions = solutions[non_dominated_indices]
+
+    filename = f"{problem_name}_combined_real_paretofront.csv"
+    file_path = os.path.join(output_dir, filename)
+    df = pd.DataFrame(non_dominated_solutions, columns=[f"obj_{i+1}" for i in range(num_obj)])
+    df.to_csv(file_path, index=False)
+    print(f"Results saved to {file_path}")
+
+# Loop through each problem and run the optimization loop
+for problem_name, problem_function in problem_mapping.items():
+    print(f"Processing problem: {problem_name}")
+    num_vars = num_vars_mapping[problem_name]
+    var_ranges = variable_ranges[problem_name]
+
+    # Define variables with specified ranges
+    variables = [Variable(f"x_{i+1}", lower_bound=lb, upper_bound=ub, initial_value=(lb + ub) / 2) for i, (lb, ub) in enumerate(var_ranges)]
+
+    # Instantiate the engineering problem
+    problem = problem_function()
+
+    combined_solutions = []
+
+    for ea_name, (ea, ea_specific_params) in eas.items():
+        print(f"Running {ea_name} on {problem_name}")
+        evolver = ea(problem, **{**common_params, **ea_specific_params})
+
+        all_solutions = []
+
+        while evolver.continue_evolution():
+            evolver.iterate()
+            all_solutions.append(evolver.population.objectives)
+
+        all_solutions = np.vstack(all_solutions)
+        combined_solutions.append(all_solutions)
+
+    combined_solutions = np.vstack(combined_solutions)
+    save_optimization_results(combined_solutions, problem_name, algorithm_name, output_dir)
