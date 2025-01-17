@@ -54,7 +54,7 @@ script_start = datetime.now()
 # Define surrogate modeling techniques
 algorithms = {
     "SVM": svm.SVR,
-    "NN": MLPRegressor,
+    "NN": lambda: MLPRegressor(max_iter=1000, tol=1e-4),
     "Ada": ensemble.AdaBoostRegressor,
     "GPR": GaussianProcessRegressor,
     "SGD": SGD,
@@ -160,9 +160,21 @@ def optimization_part(models, problem_name, algorithm_name, num_vars, num_obj, o
     logging.info(f"Starting optimization for {algorithm_name} on {problem_name}")
 
     try:
-        # Define variables
-        initial_value = 0.5  # Assuming a generic placeholder
-        variables = [Variable(f"x_{i+1}", lower_bound=0.1, upper_bound=1.0, initial_value=initial_value) for i in range(num_vars)]
+        # Define variables with correct ranges for multiple_clutch_brakes
+        # As per the multiple_clutch_brakes problem, these are the specific ranges for each variable
+        variable_ranges = [
+            (55, 80),  # Range for x_1
+            (75, 110), # Range for x_2
+            (1.5, 3),  # Range for x_3
+            (300, 1000), # Range for x_4
+            (2, 10)  # Range for x_5
+        ]
+
+        # Ensure the variable ranges are correctly defined for each variable
+        variables = [Variable(f"x_{i+1}", lower_bound=variable_ranges[i][0], 
+                              upper_bound=variable_ranges[i][1], 
+                              initial_value=(variable_ranges[i][0] + variable_ranges[i][1]) / 2)
+                     for i in range(num_vars)]
 
         # Use surrogate models as objective functions
         surrogate_objectives = [
@@ -200,6 +212,7 @@ def optimization_part(models, problem_name, algorithm_name, num_vars, num_obj, o
 
     except Exception as e:
         logging.error(f"Optimization for {algorithm_name} on {problem_name} [failed] - error: {str(e)}")
+        
 
 def save_optimization_results(solutions, problem_name, algorithm_name, ea_name, num_obj, output_folder, sample_size):
     optimization_results_dir = path.join(output_folder, "surrogate_optimization_results", problem_name)
@@ -217,8 +230,9 @@ def save_optimization_results(solutions, problem_name, algorithm_name, ea_name, 
 # Load list of already processed files
 processed_files_log = path.join(output_dir, "processed_files.csv")
 if path.exists(processed_files_log):
-    processed_files_df = pd.read_csv(processed_files_log)
-    processed_files = set(processed_files_df["File"].tolist())
+    # Check if the file exists and load without header
+    processed_files_df = pd.read_csv(processed_files_log, header=None)
+    processed_files = set(processed_files_df[0].tolist())
 else:
     processed_files = set()
 
@@ -242,7 +256,6 @@ for file in selected_files:
     
     # Log the processed file
     log_processed_file(file)
-
 
 # Save R² and MSE results
 R2results_filename = path.join(output_dir, "multiple_clutch_brakes_R2_MSE_Results.csv")
