@@ -19,6 +19,7 @@ from sklearn.neural_network import MLPRegressor
 from xgboost import XGBRegressor
 from desdeo_problem import Variable, ScalarObjective, MOProblem
 from desdeo_emo.EAs import NSGAIII, IBEA, RVEA
+from desdeo_problem.testproblems.VehicleCrashworthiness import vehicle_crashworthiness
 import warnings
 
 # Suppress specific warnings
@@ -44,7 +45,7 @@ output_dir = args.output_dir
 # Define surrogate modeling techniques
 model = {
     "SVM": svm.SVR,
-    "NN": MLPRegressor,
+    "NN": lambda: MLPRegressor(max_iter=1000, tol=1e-4),
     "Ada": ensemble.AdaBoostRegressor,
     "GPR": GaussianProcessRegressor,
     "SGD": SGD,
@@ -112,7 +113,7 @@ def train_models_for_file(file, algo):
         trained_models = []
         
         for objective_index, obj_col in enumerate(objective_columns):
-            target = data[obj_col]  # Target is the current objective column (f1, f2, etc.)
+            target = data[obj_col]
             X_train, X_test, y_train, y_test = tts(inputs, target, test_size=0.3, random_state=42)
 
             # Train the model using the selected algorithm
@@ -142,9 +143,25 @@ def optimization_part(models, num_vars, num_obj, output_dir, sample_size):
     logging.info(f"Starting optimization for Vehicle Crashworthiness")
 
     try:
-        # Define variables with an initial value
-        initial_value = 0.5
-        variables = [Variable(f"x_{i+1}", lower_bound=0.1, upper_bound=1.0, initial_value=initial_value) for i in range(num_vars)]
+        # Define variable ranges (now explicitly set for the vehicle_crashworthiness problem)
+        variable_ranges = [
+            (1.0, 3.0),  # Range for x_1
+            (1.0, 3.0),  # Range for x_2
+            (1.0, 3.0),  # Range for x_3
+            (1.0, 3.0),  # Range for x_4
+            (1.0, 3.0),  # Range for x_5
+        ]
+
+        # Ensure the variable ranges are correctly defined for each variable
+        variables = [
+            Variable(
+                f"x_{i+1}",
+                lower_bound=variable_ranges[i][0],
+                upper_bound=variable_ranges[i][1],
+                initial_value=(variable_ranges[i][0] + variable_ranges[i][1]) / 2
+            )
+            for i in range(num_vars)
+        ]
 
         # Use surrogate models as objective functions
         surrogate_objectives = [
@@ -152,13 +169,13 @@ def optimization_part(models, num_vars, num_obj, output_dir, sample_size):
             for i in range(num_obj)
         ]
 
-        # Setup the optimization problem with surrogate objectives
-        problem = MOProblem(variables=variables, objectives=surrogate_objectives)
+        # Setup the optimization problem
+        problem = MOProblem(variables=variables, objectives=surrogate_objectives, constraints=vehicle_crashworthiness().constraints)
 
         # Define the common parameters for all EAs
         common_params = {'n_iterations': 10, 'n_gen_per_iter': 50}
 
-        # Optimization algorithms to use with their specific additional parameters
+        # Different algorithms to test
         eas = {
             "NSGAIII": (NSGAIII, {}),
             "IBEA": (IBEA, {'population_size': 100}),
@@ -182,33 +199,39 @@ def optimization_part(models, num_vars, num_obj, output_dir, sample_size):
     except Exception as e:
         logging.error(f"Optimization for Vehicle Crashworthiness [failed] - error: {str(e)}")
 
-
 def save_optimization_results(solutions, ea_name, num_obj, output_dir, sample_size):
     # Save results in the specified output directory
     optimization_results_dir = path.join(output_dir, "vehicle_crashworthiness")
-    
     if not path.exists(optimization_results_dir):
         makedirs(optimization_results_dir)
-    
+
     # Include sample size in the filename
-    results_filename = path.join(optimization_results_dir, f"{ea_name}_{sample_size}samples_optimization_results.csv")
-    
+    results_filename = path.join(
+        optimization_results_dir,
+        f"{ea_name}_{sample_size}samples_optimization_results.csv"
+    )
+
     solutions_df = pd.DataFrame(solutions, columns=[f"f{i+1}" for i in range(num_obj)])
     solutions_df.to_csv(results_filename, index=False)
     print(f"Optimization results for {ea_name} saved to {results_filename}")
     logging.info(f"Optimization results for {ea_name} saved to {results_filename}")
 
+processed_files_dir = "/scratch/project_2012636/modelling_results"
+processed_files_log = path.join(processed_files_dir, "processed_files.csv")
 
 # Load list of already processed files
-processed_files_log = path.join(output_dir, "processed_files.csv")
 if path.exists(processed_files_log):
-    processed_files_df = pd.read_csv(processed_files_log)
-    processed_files = set(processed_files_df["File"].tolist())
+    processed_files_df = pd.read_csv(processed_files_log, header=None)
+    processed_files = set(processed_files_df[0].tolist())
 else:
     processed_files = set()
 
 # Function to append processed file to the log
 def log_processed_file(file):
+    # Make sure the directory exists
+    if not path.exists(processed_files_dir):
+        makedirs(processed_files_dir)
+
     with open(processed_files_log, "a") as log_file:
         log_file.write(f"{file}\n")
 
@@ -219,12 +242,11 @@ for file in selected_files:
         continue  # Skip already processed files
 
     print(f"\nProcessing file: {file}")
-
     for algo_name, algo in model.items():
         models, num_vars, num_obj, sample_size = train_models_for_file(file, algo)
         if models and num_vars is not None and num_obj is not None:
             optimization_part(models, num_vars, num_obj, output_dir, sample_size)
-    
+
     # Log the processed file
     log_processed_file(file)
 
