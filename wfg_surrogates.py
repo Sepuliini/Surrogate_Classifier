@@ -54,7 +54,7 @@ script_start = datetime.now()
 # Define surrogate modeling techniques
 algorithms = {
     "SVM": svm.SVR,
-    "NN": MLPRegressor,
+    "NN": lambda: MLPRegressor(max_iter=1000, tol=1e-4),
     "Ada": ensemble.AdaBoostRegressor,
     "GPR": GaussianProcessRegressor,
     "SGD": SGD,
@@ -92,7 +92,7 @@ if not use_full_dataset:
 else:
     selected_files = files
 
-print(f"Script started at {script_start.strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"Script started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 print(f"Found {len(files)} files in the dataset folder: {'Full dataset' if use_full_dataset else 'Selected subset'}")
 
 def extract_details_from_filename(filename):
