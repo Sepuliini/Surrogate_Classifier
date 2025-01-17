@@ -7,6 +7,7 @@ from datetime import datetime
 import logging
 import random
 import argparse
+import warnings
 import re
 from sklearn.model_selection import train_test_split as tts
 from sklearn.metrics import r2_score, mean_squared_error
@@ -19,7 +20,7 @@ from sklearn.neural_network import MLPRegressor
 from xgboost import XGBRegressor
 from desdeo_problem import Variable, ScalarObjective, MOProblem
 from desdeo_emo.EAs import NSGAIII, IBEA, RVEA
-import warnings
+from desdeo_problem.testproblems.RiverPollution import river_pollution_problem
 
 # Suppress specific warnings
 warnings.filterwarnings("ignore", category=UserWarning, message=".*X does not have valid feature names.*")
@@ -44,7 +45,7 @@ output_dir = args.output_dir
 # Define surrogate modeling techniques
 model = {
     "SVM": svm.SVR,
-    "NN": MLPRegressor,
+    "NN": lambda: MLPRegressor(max_iter=1000, tol=1e-4),
     "Ada": ensemble.AdaBoostRegressor,
     "GPR": GaussianProcessRegressor,
     "SGD": SGD,
@@ -90,18 +91,18 @@ def train_models_for_file(file, algo):
 
     try:
         # Load dataset
-        data = pd.read_csv(path.join(data_dir, file))  
-        
+        data = pd.read_csv(path.join(data_dir, file))
+
         # Identify objective columns (those starting with 'f_')
         objective_columns = [col for col in data.columns if col.startswith('f_')]
         input_columns = [col for col in data.columns if not col.startswith('f_')]
-        
+
         inputs = data[input_columns]  # Input variables (x_1, x_2, etc.)
         num_vars = inputs.shape[1]  # Number of variables
         num_obj = len(objective_columns)  # Number of objectives (f_1, f_2, etc.)
 
         trained_models = []
-        
+
         for objective_index, obj_col in enumerate(objective_columns):
             target = data[obj_col]  # Target is the current objective column (f_1, f_2, etc.)
             X_train, X_test, y_train, y_test = tts(inputs, target, test_size=0.3, random_state=42)
@@ -129,11 +130,25 @@ def train_models_for_file(file, algo):
 def optimization_part(models, problem_name, algorithm_name, num_vars, num_obj, output_dir, sample_size):
     print(f"Starting optimization with {algorithm_name} for problem {problem_name}.")
     logging.info(f"Starting optimization for {algorithm_name} on {problem_name}")
-    
+
     try:
-        # Define variables with an initial value
-        initial_value = 0.5
-        variables = [Variable(f"x_{i+1}", lower_bound=0.1, upper_bound=1.0, initial_value=initial_value) for i in range(num_vars)]
+        # Define variables with correct ranges for river_pollution_problem
+        # For river pollution problem, variables range from [0.3, 1.0] for both x_1 and x_2
+        variable_ranges = [
+            (0.3, 1.0),  # Range for x_1
+            (0.3, 1.0),  # Range for x_2
+        ]
+
+        # Ensure the variable ranges are correctly defined for each variable
+        variables = [
+            Variable(
+                f"x_{i+1}", 
+                lower_bound=variable_ranges[i][0],
+                upper_bound=variable_ranges[i][1], 
+                initial_value=(variable_ranges[i][0] + variable_ranges[i][1]) / 2
+            )
+            for i in range(num_vars)
+        ]
 
         # Use surrogate models as objective functions
         surrogate_objectives = [
@@ -141,8 +156,8 @@ def optimization_part(models, problem_name, algorithm_name, num_vars, num_obj, o
             for i in range(num_obj)
         ]
 
-        # Setup the optimization problem with surrogate objectives (assuming no constraints for river pollution problem)
-        problem = MOProblem(variables=variables, objectives=surrogate_objectives)
+        # Setup the optimization problem with surrogate objectives
+        problem = MOProblem(variables=variables, objectives=surrogate_objectives, constraints=river_pollution_problem().constraints)
 
         # Define the common parameters for all EAs
         common_params = {'n_iterations': 10, 'n_gen_per_iter': 50}
@@ -171,34 +186,45 @@ def optimization_part(models, problem_name, algorithm_name, num_vars, num_obj, o
     except Exception as e:
         logging.error(f"Optimization for {algorithm_name} on {problem_name} [failed] - error: {str(e)}")
 
-
 def save_optimization_results(solutions, problem_name, algorithm_name, ea_name, num_obj, output_dir, sample_size):
     # Directly use the provided output_dir for saving results, ensuring it does not repeat folder names
     optimization_results_dir = path.join(output_dir, problem_name)
-    
+
     if not path.exists(optimization_results_dir):
         makedirs(optimization_results_dir)
-    
+
     # Include sample size in the file name
-    results_filename = path.join(optimization_results_dir, f"{algorithm_name}_{ea_name}_{sample_size}samples_optimization_results.csv")
-    
+    results_filename = path.join(
+        optimization_results_dir,
+        f"{algorithm_name}_{ea_name}_{sample_size}samples_optimization_results.csv"
+    )
+
     solutions_df = pd.DataFrame(solutions, columns=[f"f{i+1}" for i in range(num_obj)])
     solutions_df.to_csv(results_filename, index=False)
     print(f"Optimization results for {ea_name} saved to {results_filename}")
     logging.info(f"Optimization results for {ea_name} saved to {results_filename}")
-    
+
+processed_files_dir = "/scratch/project_2012636/modelling_results"  # Fixed directory for logs
+processed_files_log = path.join(processed_files_dir, "processed_files.csv")
+
 # Load list of already processed files
-processed_files_log = path.join(output_dir, "processed_files.csv")
 if path.exists(processed_files_log):
-    processed_files_df = pd.read_csv(processed_files_log)
-    processed_files = set(processed_files_df["File"].tolist())
+    processed_files_df = pd.read_csv(processed_files_log, header=None)
+    processed_files = set(processed_files_df[0].tolist())
 else:
     processed_files = set()
 
 # Function to append processed file to the log
 def log_processed_file(file):
+    # Make sure the directory exists
+    if not path.exists(processed_files_dir):
+        makedirs(processed_files_dir)
+
     with open(processed_files_log, "a") as log_file:
         log_file.write(f"{file}\n")
+# ------------------------------------------------
+#  CHANGE ENDS HERE
+# ------------------------------------------------
 
 # Iterate over selected files
 for file in selected_files:
@@ -215,10 +241,9 @@ for file in selected_files:
         models, problem_name, num_vars, num_obj, sample_size = train_models_for_file(file, algo)
         if models and problem_name and num_vars is not None and num_obj is not None:
             optimization_part(models, problem_name, algo_name, num_vars, num_obj, output_dir, sample_size)
-    
+
     # Log the processed file
     log_processed_file(file)
-
 
 # Save the R² and MSE results to a CSV file
 r2_results_filename = path.join(output_dir, "R2_MSE_results.csv")
