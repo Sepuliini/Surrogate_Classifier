@@ -400,6 +400,7 @@ def run_all_eas(nm, nv, no, ml_list, lb, ub, n_gen=N_GEN, save_every=10):
 
                 # Save an intermediate PF (population objectives) every save_every iters and at iter 1
                 if iter_count % save_every == 0 or iter_count == 1:
+                    logging.info(f"{ea_name}: saving PF snapshot #{len(all_fronts)+1} at iter={iter_count}")
                     try:
                         # evo.population may be a list of individuals; extract objectives robustly
                         pop_objs = None
