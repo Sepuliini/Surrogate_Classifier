@@ -25,18 +25,11 @@ from sklearn.neighbors import KNeighborsRegressor as KNR
 from sklearn.tree import DecisionTreeRegressor as DTR
 from sklearn.neural_network import MLPRegressor
 from xgboost import XGBRegressor
-
-try:
-    from pymoo.indicators.hv import HV
-    def hypervolume(A, ref_point):
-        return HV(ref_point=ref_point).do(A)
-except ImportError:
-    def hypervolume(A, ref_point):
-        return np.nan
+from pymoo.indicators.hv import HV
 
 from desdeo_problem import Variable, ScalarObjective, MOProblem
 from desdeo_emo.EAs import NSGAIII, RVEA, IBEA
-
+from desdeo_problem.testproblems.DBMOPP.DBMOPP_generator import DBMOPP_generator
 from desdeo_problem.testproblems.EngineeringRealWorld import re21, re22, re23, re24, re25, re31, re32, re33
 from desdeo_problem.testproblems.MultipleClutchBrakes import multiple_clutch_brakes
 from desdeo_problem.testproblems.RiverPollution import river_pollution_problem
@@ -49,6 +42,7 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*X does not ha
 # ---------------------------
 # Argument parsing
 # ---------------------------
+
 parser = argparse.ArgumentParser(description="Run surrogate evaluation for selected problem suite.")
 parser.add_argument(
     "--suite",
@@ -68,8 +62,8 @@ args = parser.parse_args()
 
 # ================== EXPERIMENT KNOBS ==================
 BASE_SEED   = 2025
-POP_SIZE    = 10
-N_GEN       = 10
+POP_SIZE    = 150
+N_GEN       = 50
 EPS_CLEAN       = 1e-3
 PF_RANGE_FLOOR  = 1e-9
 RUN_TAG = f"EA_pop{POP_SIZE}_gen{N_GEN}_seed{BASE_SEED}_eps{EPS_CLEAN}"
@@ -126,6 +120,32 @@ except Exception as e:
 # ----- Metrics helpers -----
 def euclidean_distance(a, b): return np.linalg.norm(a - b)
 
+def hypervolume(A, ref_point=None):
+    if A is None or A.size == 0:
+        return np.nan
+    A = np.atleast_2d(A).astype(float)
+    mask_finite = np.isfinite(A).all(axis=1)
+    if not mask_finite.all():
+        A = A[mask_finite]
+    if A.size == 0:
+        return np.nan
+
+    # Normalize and ensure 0 ≤ A ≤ 1
+    A = np.clip(A, 0, 1)
+
+    # Safe reference point
+    if ref_point is None:
+        ref_point = np.ones(A.shape[1]) * 1.1
+
+    try:
+        hv = HV(ref_point=ref_point).do(A)
+        if not np.isfinite(hv):
+            return np.nan
+        return float(hv)
+    except Exception as e:
+        logging.warning(f"HV computation failed: {e}")
+        return np.nan
+
 def igd(A, R):
     if A.size == 0 or R.size == 0: return np.nan
     return float(np.mean([np.min([euclidean_distance(r, a) for a in A]) for r in R]))
@@ -141,9 +161,12 @@ def eps_additive(A: np.ndarray, R: np.ndarray) -> float:
     d = [np.min(np.max(A - r[np.newaxis, :], axis=1)) for r in R]
     return float(np.max(d))
 
-def eps_multiplicative(A: np.ndarray, R: np.ndarray, tiny=1e-12) -> float:
-    if A.size == 0 or R.size == 0: return np.nan
-    d = [np.min(np.max(A / (r[np.newaxis, :] + tiny), axis=1)) for r in R]
+def eps_multiplicative(A: np.ndarray, R: np.ndarray, tiny=1e-8) -> float:
+    if A.size == 0 or R.size == 0:
+        return np.nan
+    # Clip R to tiny value to avoid huge ratios
+    R_safe = np.clip(R, tiny, None)
+    d = [np.min(np.max(A / r[np.newaxis, :], axis=1)) for r in R_safe]
     return float(np.max(d))
 
 # ----- Problem instances -----
@@ -152,6 +175,7 @@ ED_MAP = {
     'river_pollution_problem': river_pollution_problem,
     'vehicle_crashworthiness': vehicle_crashworthiness
 }
+
 
 variable_ranges = {
     "multiple_clutch_brakes": [(55, 80), (75, 110), (1.5, 3), (300, 1000), (2, 10)],
@@ -184,6 +208,27 @@ def build_algorithms(nv):
         "GBR": lambda: ensemble.GradientBoostingRegressor(random_state=rs),
         "XGB": lambda: XGBRegressor(random_state=rs, n_estimators=200, verbosity=0)
     }
+    
+def normalize(A, ref):
+    """Min-max normalize A using ref PF bounds (safe for NaNs and zero span)."""
+    if A is None or ref is None or A.size == 0 or ref.size == 0:
+        return np.empty_like(A)
+    A = np.atleast_2d(A).astype(float)
+    ref = np.atleast_2d(ref).astype(float)
+
+    # Remove NaN/inf rows from ref to avoid invalid min/max
+    ref = ref[np.isfinite(ref).all(axis=1)]
+    if ref.size == 0:
+        return np.empty_like(A)
+
+    mins = np.nanmin(ref, axis=0)
+    maxs = np.nanmax(ref, axis=0)
+    span = np.where((maxs - mins) < 1e-12, 1.0, maxs - mins)
+
+    normed = (A - mins) / span
+    return np.clip(normed, 0.0, 1.0)
+
+
 
 # ----- Extract filename details -----
 pattern = re.compile(r"^([A-Za-z0-9_]+)_(\d+)var_(\d+)obj_(\d+)samples(?:_([A-Za-z0-9_]+))?\.csv$")
@@ -210,6 +255,7 @@ def extract_details(fn):
 # ----- Load reference PFs -----
 real_path = path.join(base_folder, "modelling_results", "real_paretofronts")
 real_fronts = {}
+reference_pfs = {}
 
 def load_pf_files(folder):
     for subdir, _, files in os.walk(folder):
@@ -229,28 +275,83 @@ def load_pf_files(folder):
 if path.exists(real_path):
     load_pf_files(real_path)
     
-def find_reference_pf(nm: str, no: int, nv: int):
-    nm = nm.lower()
-    for k, v in real_fronts.items():
-        if k[0].lower() == nm and int(k[1]) == int(no):
-            return np.array(v, dtype=float)
-    return np.empty((0, no))
+    
+def find_reference_pf(problem_name, no, nv):
+    """Locate and load reference PF, handling different naming patterns."""
+    base_dir = "/scratch/project_2014748/modelling_results_all_data/real_paretofronts"
+    suite = ("DTLZ" if problem_name.upper().startswith("DTLZ") else
+             "WFG" if problem_name.upper().startswith("WFG") else
+             "Engineering" if problem_name.lower().startswith(("re", "river", "vehicle")) else
+             "DBMOPP" if problem_name.upper().startswith("DBMOPP") else None)
+    if suite is None:
+        logging.warning(f"Unknown suite for {problem_name}, skipping reference PF.")
+        return np.empty((0, no))
+
+    pf_dir = os.path.join(base_dir, suite, problem_name)
+    if not os.path.exists(pf_dir):
+        logging.warning(f"No PF dir for {problem_name} at {pf_dir}")
+        return np.empty((0, no))
+
+    files = [f for f in os.listdir(pf_dir) if f.endswith(".csv")]
+    if not files:
+        logging.warning(f"No PF files in {pf_dir}")
+        return np.empty((0, no))
+
+    # --- Matching rules ---
+    candidates = []
+    for f in files:
+        lower = f.lower()
+        if suite == "DTLZ" and f"real_pareto_front_{no}obj" in lower:
+            candidates.append(f)
+        elif suite == "WFG" and f"pareto_front_{no}obj" in lower:
+            candidates.append(f)
+        elif suite == "DBMOPP" and f"real_pareto_front_{no}obj" in lower:
+            candidates.append(f)
+        elif suite == "Engineering" and "_pf_" in lower:
+            candidates.append(f)
+
+    if not candidates:
+        # fallback: allow mismatched variable count
+        for f in files:
+            if f"{no}obj" in f:
+                candidates.append(f)
+
+    if not candidates:
+        logging.warning(f"No matching PF for {problem_name} (no={no}, nv={nv})")
+        return np.empty((0, no))
+
+    fsel = sorted(candidates)[0]
+    fpath = os.path.join(pf_dir, fsel)
+    try:
+        pf_arr = pd.read_csv(fpath).values
+        logging.info(f"find_reference_pf: loaded reference PF from disk {fpath} -> {pf_arr.shape}")
+        return pf_arr
+    except Exception as e:
+        logging.warning(f"Could not load reference PF {fpath}: {e}")
+        return np.empty((0, no))
+
 
 def run_all_eas(nm, nv, no, ml_list, lb, ub, n_gen=N_GEN, save_every=10):
-    """
-    Run NSGAIII, RVEA, IBEA on the surrogate models for up to n_gen iterations (safety-limited).
-    Periodically saves intermediate Pareto fronts in memory (every `save_every` iterations),
-    then combines them (per EA) into a final non-dominated front and computes metrics.
-
-    Returns a dict with EA names as keys and dicts containing metrics + nd_arr.
-    """
     results = {}
-    max_iter_guard = max(1, int(n_gen * 3))
+    results = {ea_name: {} for ea_name in ["NSGAIII", "RVEA", "IBEA"]}
+    results["Combined"] = dict(IGD_norm=np.nan, HV=np.nan, EpsAdd=np.nan, EpsMulti=np.nan, nd_arr=np.empty((0, no)))
 
-    # helper to compute non-dominated filter on a 2D array
+    DBMOPP_PARAMS = {
+    "DBMOPP1": dict(n_local_pareto_regions=2, n_dominance_res_regions=0, n_global_pareto_regions=3, pareto_set_type=0, constraint_type=1, ndo=0, vary_sol_density=False, vary_objective_scales=False, prop_neutral=0.0),
+    "DBMOPP2": dict(n_local_pareto_regions=2, n_dominance_res_regions=1, n_global_pareto_regions=3, pareto_set_type=1, constraint_type=3, ndo=0, vary_sol_density=False, vary_objective_scales=False, prop_neutral=0.0),
+    "DBMOPP3": dict(n_local_pareto_regions=3, n_dominance_res_regions=2, n_global_pareto_regions=4, pareto_set_type=2, constraint_type=5, ndo=0, vary_sol_density=False, vary_objective_scales=False, prop_neutral=0.0),
+    "DBMOPP4": dict(n_local_pareto_regions=3, n_dominance_res_regions=4, n_global_pareto_regions=5, pareto_set_type=2, constraint_type=8, ndo=0, vary_sol_density=False, vary_objective_scales=False, prop_neutral=0.1),
+    "DBMOPP5": dict(n_local_pareto_regions=1, n_dominance_res_regions=0, n_global_pareto_regions=3, pareto_set_type=0, constraint_type=1, ndo=0, vary_sol_density=False, vary_objective_scales=False, prop_neutral=0.0),
+    "DBMOPP6": dict(n_local_pareto_regions=2, n_dominance_res_regions=1, n_global_pareto_regions=4, pareto_set_type=1, constraint_type=4, ndo=0, vary_sol_density=False, vary_objective_scales=False, prop_neutral=0.2),
+    "DBMOPP7": dict(n_local_pareto_regions=2, n_dominance_res_regions=2, n_global_pareto_regions=5, pareto_set_type=2, constraint_type=7, ndo=0, vary_sol_density=False, vary_objective_scales=False, prop_neutral=0.0),
+}
+
+    # ---------- Helper functions (single definitions) ----------
     def nondominated_filter(arr):
+        """Return the non-dominated subset of arr (rows = points, cols = objectives)."""
         if arr.size == 0:
             return np.empty((0, arr.shape[1] if arr.ndim == 2 else 0))
+        arr = np.asarray(arr, dtype=float)
         npts = arr.shape[0]
         is_nd = np.ones(npts, dtype=bool)
         for i in range(npts):
@@ -259,40 +360,160 @@ def run_all_eas(nm, nv, no, ml_list, lb, ub, n_gen=N_GEN, save_every=10):
             for j in range(npts):
                 if i == j or not is_nd[j]:
                     continue
-                # j dominates i?
-                if np.all(arr[j] <= arr[i]) and np.any(arr[j] < arr[i]):
-                    is_nd[i] = False
-                    break
+                try:
+                    if np.all(arr[j] <= arr[i]) and np.any(arr[j] < arr[i]):
+                        is_nd[i] = False
+                        break
+                except Exception:
+                    continue
         return arr[is_nd]
 
+    def sanitize_pf(pf, no, floor=1e-8):
+        """Ensure pf is finite, 2D, and apply a tiny floor to avoid zero issues."""
+        if pf is None or pf.size == 0:
+            return np.empty((0, no))
+        pf = np.atleast_2d(np.asarray(pf, dtype=float))
+        mask = np.isfinite(pf).all(axis=1)
+        if not mask.all():
+            logging.warning(f"Dropping {np.sum(~mask)} non-finite rows from PF for {nm}")
+            pf = pf[mask]
+        # apply tiny floor (preserve sign)
+        pf = np.where(np.abs(pf) < floor, np.sign(pf) * floor, pf)
+        return pf
+
+    def apply_maximize_inversion(arr, maximize_flags):
+        """If maximize_flags[i] is True, negate that objective column."""
+        if arr is None or arr.size == 0:
+            return arr
+        arr = np.asarray(arr, dtype=float).copy()
+        for i, mf in enumerate(maximize_flags):
+            if mf:
+                arr[:, i] = -arr[:, i]
+        return arr
+
+    def compute_metrics(nd_arr, pf_arr):
+        """Compute union-normalized HV, IGD, additive and multiplicative epsilons."""
+        if nd_arr is None or pf_arr is None or nd_arr.size == 0 or pf_arr.size == 0:
+            return dict(IGD_norm=np.nan, HV=np.nan, EpsAdd=np.nan, EpsMulti=np.nan)
+
+        nd = np.atleast_2d(np.asarray(nd_arr, dtype=float))
+        pf = np.atleast_2d(np.asarray(pf_arr, dtype=float))
+
+        # union normalization (min..max over both sets)
+        union = np.vstack([nd, pf])
+        min_vals = np.min(union, axis=0)
+        max_vals = np.max(union, axis=0)
+        range_vals = max_vals - min_vals
+        # avoid zero-range by setting range to 1 for zero-range dims
+        zero_mask = range_vals == 0
+        if np.any(zero_mask):
+            range_vals[zero_mask] = 1.0
+
+        nd_norm = (nd - min_vals) / range_vals
+        pf_norm = (pf - min_vals) / range_vals
+
+        # Clip tiny/negative numerical noise (keep >= 0)
+        nd_norm = np.clip(nd_norm, 0.0, None)
+        pf_norm = np.clip(pf_norm, 0.0, None)
+
+        # compute dynamic ref point for hv slightly above union maxima
+        try:
+            ref_point = np.max(np.vstack([nd_norm, pf_norm]), axis=0) * 1.05
+            # ensure ref_point is >= 1e-6 and > max to be a proper reference
+            ref_point = np.where(ref_point <= np.max(np.vstack([nd_norm, pf_norm]), axis=0),
+                                 np.max(np.vstack([nd_norm, pf_norm]), axis=0) + 1e-6,
+                                 ref_point)
+        except Exception:
+            ref_point = np.ones(nd_norm.shape[1]) * 1.05
+
+        hv_val = np.nan
+        igd_val = np.nan
+        eps_a = np.nan
+        eps_m = np.nan
+
+        try:
+            hv_val = hypervolume(nd_norm, ref_point=ref_point)
+        except Exception as e:
+            logging.warning(f"Hypervolume computation failed for {nm}: {e}")
+            hv_val = np.nan
+
+        try:
+            igd_val = igd(nd_norm, pf_norm)
+        except Exception as e:
+            logging.warning(f"IGD computation failed for {nm}: {e}")
+            igd_val = np.nan
+
+        try:
+            eps_a = eps_additive(nd_norm, pf_norm)
+        except Exception as e:
+            logging.warning(f"Additive epsilon computation failed for {nm}: {e}")
+            eps_a = np.nan
+
+        try:
+            # multiplicative epsilon: avoid division-by-zero with small floor
+            eps_m = eps_multiplicative(
+                np.clip(nd_norm, 1e-12, None),
+                np.clip(pf_norm, 1e-12, None)
+            )
+        except Exception as e:
+            logging.warning(f"Multiplicative epsilon computation failed for {nm}: {e}")
+            eps_m = np.nan
+
+        return dict(IGD_norm=igd_val, HV=hv_val, EpsAdd=eps_a, EpsMulti=eps_m)
+
+    def make_obj_from_model(m):
+        """Return a callable objective function that evaluates the surrogate m."""
+        def obj_fn(x):
+            x_arr = np.atleast_2d(np.asarray(x, dtype=float))
+            pred = m.predict(x_arr)
+            # Ensure scalar float returned for single-point evaluation
+            if np.ndim(pred) == 0:
+                return float(pred)
+            # if model returns array-like, take first row/element
+            try:
+                return float(np.asarray(pred).reshape(-1)[0])
+            except Exception:
+                return float(np.asarray(pred).squeeze())
+        return obj_fn
+
+    # ---------- Build maximize flags (try to query ED_MAP) ----------
+    maximize_flags = [False] * no
+    try:
+        if nm in ED_MAP:
+            try:
+                inst = ED_MAP[nm]()
+                maximize_flags = [
+                    bool(obj.maximize[0]) if isinstance(obj.maximize, (list, np.ndarray)) else bool(obj.maximize)
+                    for obj in inst.objectives
+                ]
+            except Exception:
+                maximize_flags = [False] * no
+    except Exception:
+        maximize_flags = [False] * no
+
+    # ---------- Iterate EAs ----------
     for ea_name, EAcls in [("NSGAIII", NSGAIII), ("RVEA", RVEA), ("IBEA", IBEA)]:
         logging.info(f"Starting {ea_name} on problem={nm} (nv={nv}, no={no})")
 
-        # --- Variables and constraints selection ---
-        constraints = None
+        # --- Prepare variables and constraints (same logic, simplified) ---
         vars_ = None
-
+        constraints = None
         try:
-            # Engineering problems with explicit variable ranges & desdeo instances
             if nm in variable_ranges:
                 bounds = variable_ranges[nm]
-                # ensure bounds length matches nv (if mismatch, fall back to lb/ub or 0..1)
                 if len(bounds) >= nv:
                     vars_ = [
-                        Variable(f"x{i+1}",
-                                 lower_bound=bounds[i][0],
-                                 upper_bound=bounds[i][1],
+                        Variable(f"x{i+1}", lower_bound=bounds[i][0], upper_bound=bounds[i][1],
                                  initial_value=bounds[i][0] + 0.5 * (bounds[i][1] - bounds[i][0]))
                         for i in range(nv)
                     ]
                 else:
-                    # fallback to numeric lb/ub passed in
                     vars_ = [
                         Variable(f"x{i+1}", lower_bound=float(lb[i]), upper_bound=float(ub[i]),
                                  initial_value=float(lb[i] + 0.5 * (ub[i] - lb[i])))
                         for i in range(nv)
                     ]
-                # try to fetch desdeo constraints if available
+                # attempt to fetch desdeo constraints
                 try:
                     inst_fn = ED_MAP.get(nm)
                     if inst_fn is not None:
@@ -300,92 +521,90 @@ def run_all_eas(nm, nv, no, ml_list, lb, ub, n_gen=N_GEN, save_every=10):
                         constraints = getattr(inst, "constraints", None)
                 except Exception:
                     logging.debug(f"Could not instantiate ED_MAP[{nm}] to read constraints.")
-                    constraints = getattr(ED_MAP.get(nm, lambda: None)(), "constraints", None)
+                    constraints = None
 
-            # DBMOPP problems: recreate a DBMOPP_generator to extract constraints
             elif nm.upper().startswith("DBMOPP"):
-                # DBMOPP uses decision variables in [0,1]
+                # Default variables
                 vars_ = [Variable(f"x{i+1}", lower_bound=0.0, upper_bound=1.0, initial_value=0.5) for i in range(nv)]
                 try:
                     from desdeo_problem.testproblems.DBMOPP.DBMOPP_generator import DBMOPP_generator
-                    # attempt to create a DBMOPP instance with minimal params; this will provide constraints attr if generator supports it
-                    try:
-                        dbm = DBMOPP_generator(k=no, n=nv, nm=1000)
-                    except TypeError:
-                        # fallback if generator requires different signature
-                        dbm = DBMOPP_generator(no, nv)
-                    constraints = getattr(dbm, "constraints", None)
-                    logging.info(f"DBMOPP recreated for {nm}: constraints loaded={constraints is not None}")
-                except Exception as e:
-                    constraints = None
-                    logging.warning(f"Could not recreate DBMOPP for {nm} to extract constraints: {e}")
-
-            # Benchmarks (DTLZ/WFG) or others: use lb/ub if provided else assume [0,1]
-            else:
-                # if lb/ub are arrays (from dataset) use them, otherwise default [0,1]
-                try:
-                    if lb is not None and ub is not None and len(lb) == nv:
-                        vars_ = [
-                            Variable(f"x{i+1}", lower_bound=float(lb[i]), upper_bound=float(ub[i]),
-                                     initial_value=float(lb[i] + 0.5 * (ub[i] - lb[i])))
-                            for i in range(nv)
-                        ]
+            
+                    params = DBMOPP_PARAMS.get(nm, None)
+            
+                    if params is not None:
+                        dbm = DBMOPP_generator(
+                            nlp=params["n_local_pareto_regions"],
+                            ndr=params["n_dominance_res_regions"],
+                            ngp=params["n_global_pareto_regions"],
+                            prop_constraint_checker=params.get("prop_neutral", 0.0),
+                            pareto_set_type=params["pareto_set_type"],
+                            constraint_type=params["constraint_type"],
+                            k=no,          # number of objectives
+                            n=nv           # number of decision variables
+                        )
+                        constraints = getattr(dbm, "constraints", None)
                     else:
-                        vars_ = [Variable(f"x{i+1}", lower_bound=0.0, upper_bound=1.0, initial_value=0.5) for i in range(nv)]
-                except Exception:
+                        logging.warning(f"No DBMOPP parameters found for {nm}; using empty constraints")
+                        constraints = None
+            
+                except Exception as e:
+                    logging.warning(f"Could not recreate DBMOPP for {nm} to extract constraints: {e}")
+                    constraints = None
+
+            else:
+                # generic: use provided lb/ub if consistent else [0,1]
+                if lb is not None and ub is not None and len(lb) == nv:
+                    vars_ = [
+                        Variable(f"x{i+1}", lower_bound=float(lb[i]), upper_bound=float(ub[i]),
+                                 initial_value=float(lb[i] + 0.5 * (ub[i] - lb[i])))
+                        for i in range(nv)
+                    ]
+                else:
                     vars_ = [Variable(f"x{i+1}", lower_bound=0.0, upper_bound=1.0, initial_value=0.5) for i in range(nv)]
                 constraints = None
-
         except Exception as e:
             logging.warning(f"Error while preparing variables/constraints for {nm}: {e}\n{traceback.format_exc()}")
-            # ensure we have a vars_ fallback
             if vars_ is None:
                 vars_ = [Variable(f"x{i+1}", lower_bound=0.0, upper_bound=1.0, initial_value=0.5) for i in range(nv)]
             constraints = None
 
-        # --- Objective wrappers (surrogates) ---
-        def make_obj(m):
-            return lambda x: m.predict(np.atleast_2d(x))[0]
-
-        maximize_flags = [False] * no
-        try:
-            if nm in ED_MAP:
-                maximize_flags = [
-                    bool(obj.maximize[0]) if isinstance(obj.maximize, (list, np.ndarray))
-                    else bool(obj.maximize)
-                    for obj in ED_MAP[nm]().objectives
-                ]
-        except Exception:
-            # if ED_MAP item fails, keep default False flags
-            maximize_flags = [False] * no
-
-        objs = [ScalarObjective(f"f{i+1}", make_obj(m), maximize=[maximize_flags[i]])
-                for i, m in enumerate(ml_list)]
+        # --- Build ScalarObjective list from ml_list (no clipping) ---
+        objs = []
+        for i, m in enumerate(ml_list):
+            if m is None:
+                # if model missing, create a dummy objective that returns large values
+                def dummy_obj(x, idx=i):
+                    return 1e12
+                objs.append(ScalarObjective(f"f{i+1}", dummy_obj, maximize=[bool(maximize_flags[i])]))
+            else:
+                objs.append(ScalarObjective(f"f{i+1}", make_obj_from_model(m), maximize=[bool(maximize_flags[i])]))
 
         problem = MOProblem(objectives=objs, variables=vars_, constraints=constraints)
 
-        # --- Initialize EA instance ---
+        # --- Initialize EA with consistent population size ---
         np.random.seed(BASE_SEED)
         try:
             if ea_name == "NSGAIII":
-                evo = NSGAIII(problem)
+                evo = NSGAIII(problem, population_size=POP_SIZE)
             elif ea_name == "RVEA":
                 evo = RVEA(problem, population_size=POP_SIZE)
             elif ea_name == "IBEA":
                 evo = IBEA(problem, population_size=POP_SIZE)
             else:
                 logging.warning(f"Unknown EA {ea_name}, skipping.")
+                results[ea_name] = dict(IGD_norm=np.nan, HV=np.nan, EpsAdd=np.nan, EpsMulti=np.nan, nd_arr=np.empty((0, no)))
                 continue
         except Exception as e:
             logging.warning(f"Failed to initialize EA {ea_name} for {nm}: {e}\n{traceback.format_exc()}")
             results[ea_name] = dict(IGD_norm=np.nan, HV=np.nan, EpsAdd=np.nan, EpsMulti=np.nan, nd_arr=np.empty((0, no)))
             continue
 
-        # --- Evolution loop and intermediate PF saving ---
+        # --- Evolution loop: run exactly n_gen iterations (or break earlier if EA signals termination) ---
         iter_count = 0
-        all_fronts = []  # list of arrays (each saved PF)
+        all_fronts = []
         try:
-            for _ in range(max_iter_guard):
+            for iter_idx in range(n_gen):
+                # check EA continue flag if available
                 try:
                     cont = evo.continue_evolution()
                 except Exception:
@@ -395,65 +614,76 @@ def run_all_eas(nm, nv, no, ml_list, lb, ub, n_gen=N_GEN, save_every=10):
                     logging.info(f"{ea_name} signalled termination at iter {iter_count} for {nm}.")
                     break
 
-                evo.iterate()
+                # iterate once
+                try:
+                    evo.iterate()
+                except Exception as e:
+                    logging.warning(f"{ea_name} iterate failed at iter {iter_count} for {nm}: {e}\n{traceback.format_exc()}")
+                    break
+
                 iter_count += 1
 
-                # Save an intermediate PF (population objectives) every save_every iters and at iter 1
-                if iter_count % save_every == 0 or iter_count == 1:
-                    logging.info(f"{ea_name}: saving PF snapshot #{len(all_fronts)+1} at iter={iter_count}")
+                # Save intermediate PFs at requested frequency (and first iter)
+                if (iter_count % save_every == 0) or (iter_count == 1):
                     try:
-                        # evo.population may be a list of individuals; extract objectives robustly
+                        # Try extracting objectives from population
                         pop_objs = None
                         try:
-                            # try attribute access first (desdeo individuals often have .objectives)
                             pop_objs = np.array([ind.objectives for ind in evo.population])
                         except Exception:
                             try:
-                                # maybe evo.population.objectives exists or population is a container
                                 pop_objs = np.array(getattr(evo.population, "objectives", []))
                             except Exception:
                                 pop_objs = None
 
-                        if pop_objs is None or pop_objs.size == 0:
-                            logging.debug(f"{ea_name} on {nm}: could not extract population objectives at iter {iter_count}")
-                        else:
-                            # ensure shape (n_points, n_objectives)
+                        if pop_objs is not None and pop_objs.size > 0:
                             pop_objs = np.atleast_2d(pop_objs).astype(float)
                             if pop_objs.shape[1] != no:
-                                # sometimes objectives may be nested differently; try reshape
                                 pop_objs = pop_objs.reshape(-1, no)
                             all_fronts.append(pop_objs)
                             logging.info(f"{ea_name} on {nm}: saved intermediate PF at iter={iter_count} (points={pop_objs.shape[0]})")
+                        else:
+                            logging.debug(f"{ea_name} on {nm}: could not extract population objectives at iter {iter_count}")
                     except Exception as e:
                         logging.warning(f"Could not extract/populate PF at iter {iter_count} for {ea_name} {nm}: {e}")
-
-                # stop when we've reached requested n_gen (not guard)
-                if iter_count >= n_gen:
-                    logging.info(f"{ea_name} reached requested n_gen={n_gen} (iter_count={iter_count}).")
-                    break
 
         except Exception as e:
             logging.warning(f"{ea_name} iteration loop failed for {nm}: {e}\n{traceback.format_exc()}")
 
-        # --- Extract final solutions from the EA to include in saved fronts ---
+        # --- Extract final solutions robustly ---
+        final_arr = np.empty((0, no))
         try:
-            sol = evo.end()[1]
-        except Exception:
-            sol = None
-
-        if sol is None or len(sol) == 0:
-            final_arr = np.empty((0, no))
-        else:
+            # Some EAs provide population attribute, some provide end() return
             try:
-                final_arr = np.vstack([np.asarray(F, dtype=float).reshape(-1) for F in sol])
+                pop = getattr(evo, "population", None)
+                if pop is not None and len(pop) > 0:
+                    final_arr = np.array([ind.objectives for ind in pop], dtype=float)
+                else:
+                    # fallback to end()
+                    end_res = None
+                    try:
+                        end_res = evo.end()
+                    except Exception:
+                        end_res = None
+                    if end_res is not None:
+                        # try to find a list/array of objectives in end_res
+                        if isinstance(end_res, (list, tuple)) and len(end_res) > 1:
+                            candidate = end_res[1]
+                            try:
+                                final_arr = np.vstack([np.asarray(F, dtype=float).reshape(-1) for F in candidate])
+                            except Exception:
+                                # last fallback: try to treat candidate as already an ndarray
+                                final_arr = np.atleast_2d(np.asarray(candidate, dtype=float))
             except Exception:
-                logging.warning(f"Failed to stack final solutions for {nm} {ea_name}: {traceback.format_exc()}")
                 final_arr = np.empty((0, no))
+        except Exception:
+            logging.warning(f"Failed to extract final solutions for {ea_name} {nm}: {traceback.format_exc()}")
+            final_arr = np.empty((0, no))
 
         if final_arr.size > 0:
             all_fronts.append(final_arr)
 
-        # --- Combine fronts and filter non-dominated ---
+        # --- Combine fronts into one array and clean ---
         if len(all_fronts) > 0:
             try:
                 combined = np.vstack(all_fronts)
@@ -463,220 +693,187 @@ def run_all_eas(nm, nv, no, ml_list, lb, ub, n_gen=N_GEN, save_every=10):
         else:
             combined = np.empty((0, no))
 
-        # --- Basic sanity/logging for combined front before ND filter ---
-        try:
-            logging.debug(f"{ea_name} {nm}: combined shape before clean = {combined.shape}")
-            if combined.size > 0:
-                # drop any rows that contain NaN/Inf
-                mask_finite = np.isfinite(combined).all(axis=1)
-                if not mask_finite.all():
-                    logging.warning(f"{ea_name} {nm}: dropping {np.sum(~mask_finite)} non-finite rows from combined fronts")
-                    combined = combined[mask_finite]
-                logging.debug(f"{ea_name} {nm}: combined stats min={np.nanmin(combined, axis=0)}, max={np.nanmax(combined, axis=0)}, mean={np.nanmean(combined, axis=0)}")
-        except Exception as e:
-            logging.warning(f"Debugging combined front failed: {e}")
+        # drop non-finite rows
+        if combined.size > 0:
+            mask_finite = np.isfinite(combined).all(axis=1)
+            if not mask_finite.all():
+                logging.warning(f"{ea_name} {nm}: dropping {np.sum(~mask_finite)} non-finite rows from combined fronts")
+                combined = combined[mask_finite]
 
-        # Now filter non-dominated (minimization assumed)
-        def nondominated_filter_safe(arr):
-            if arr.size == 0:
-                return np.empty((0, no))
-            npts = arr.shape[0]
-            is_nd_local = np.ones(npts, dtype=bool)
-            for i in range(npts):
-                if not is_nd_local[i]:
-                    continue
-                for j in range(npts):
-                    if i == j or not is_nd_local[j]:
-                        continue
-                    # j dominates i?
-                    try:
-                        if np.all(arr[j] <= arr[i]) and np.any(arr[j] < arr[i]):
-                            is_nd_local[i] = False
-                            break
-                    except Exception:
-                        continue
-            return arr[is_nd_local]
+        # compute non-dominated front
+        nd_arr = nondominated_filter(combined)
 
-        nd_arr = nondominated_filter_safe(combined)
-
-        # --- Reference PF selection (cache then disk fallback) ---
-        pf_arr = find_reference_pf(nm, no, nv)
-        
-        # dynamic disk load fallback (keeps your previous paths)
-        if pf_arr.size == 0:
+        # --- Get reference PF (cache/disk fallback) ---
+        pf_arr = reference_pfs.get(nm, None)
+        if pf_arr is None or pf_arr.size == 0:
             try:
-                base = "/scratch/project_2014748/modelling_results_all_data/real_paretofronts"
-                fpath = None
-                nm_lower = nm.lower()
-                if nm_lower.startswith("wfg"):
-                    fpath = os.path.join(base, "WFG", nm, f"pareto_front_{no}obj_30vars.csv")
-                elif nm_lower.startswith("dtlz"):
-                    fpath = os.path.join(base, "DTLZ", nm, f"real_pareto_front_{nm}_{no}obj.txt")
-                elif nm_lower.startswith("dbmopp"):
-                    fpath = os.path.join(base, "DBMOPP", f"{nm}_real_pareto_front_{no}obj.csv")
-                elif nm_lower.startswith("re"):
-                    fpath = os.path.join(base, "engineering", f"{nm}_NSGAIII_combinedSeeds.csv")
-        
-                if fpath and os.path.exists(fpath):
-                    pf_arr = np.loadtxt(fpath, delimiter=",")
-                    logging.info(f"Loaded reference PF for {nm} from disk ({pf_arr.shape})")
-                else:
-                    logging.warning(f"No reference PF found for {nm}. Metrics will be NaN.")
+                pf_arr = find_reference_pf(nm, no, nv)
+                if pf_arr is not None and pf_arr.size > 0:
+                    reference_pfs[nm] = pf_arr
+                    logging.info(f"Cached reference PF for {nm} ({np.atleast_2d(pf_arr).shape})")
             except Exception as e:
-                logging.warning(f"Failed to load reference PF for {nm}: {e}")
-        
-        # --- Sanitize reference PF ---
-        if pf_arr.size > 0:
-            pf_arr = np.atleast_2d(pf_arr).astype(float)
-            pf_mask = np.isfinite(pf_arr).all(axis=1)
-            if not pf_mask.all():
-                logging.warning(f"{nm}: dropping {np.sum(~pf_mask)} non-finite rows from reference PF")
-                pf_arr = pf_arr[pf_mask]
-            logging.debug(f"{nm}: ref PF stats min={np.nanmin(pf_arr, axis=0)}, max={np.nanmax(pf_arr, axis=0)}")
+                logging.warning(f"No reference PF found for {nm}: {e}")
+                pf_arr = np.empty((0, no))
 
+        # sanitize and apply maximize inversion
+        pf_safe = sanitize_pf(pf_arr, no)
+        nd_safe = np.atleast_2d(nd_arr) if nd_arr.size > 0 else np.empty((0, no))
+        nd_safe = apply_maximize_inversion(nd_safe, maximize_flags)
+        pf_safe = apply_maximize_inversion(pf_safe, maximize_flags)
 
-        # --- Apply maximize flag inversion consistently (minimization assumed by EAs) ---
-        try:
-            for i, mf in enumerate(maximize_flags):
-                if mf:
-                    if pf_arr.size > 0:
-                        pf_arr[:, i] = -pf_arr[:, i]
-                    if nd_arr.size > 0:
-                        nd_arr[:, i] = -nd_arr[:, i]
-        except Exception as e:
-            logging.warning(f"Failed applying maximize inversion for {nm}: {e}")
-
-        # --- final cleaning of nd_arr before metrics ---
-        if nd_arr.size > 0:
-            # drop any non-finite after inversion
-            nd_mask = np.isfinite(nd_arr).all(axis=1)
-            if not nd_mask.all():
-                logging.warning(f"{nm}: dropping {np.sum(~nd_mask)} non-finite rows from ND arr")
-                nd_arr = nd_arr[nd_mask]
-
-        # --- Protective measures for multiplicative eps and hypervolume ---
-        # Avoid division by zero in multiplicative epsilon by enforcing a tiny floor on reference values
-        pf_safe = pf_arr.copy() if pf_arr.size > 0 else np.empty((0, no))
+        # debug info
+        logging.info(f"Debug {nm} {ea_name}: ND shape={nd_safe.shape}, PF shape={pf_safe.shape}")
+        if nd_safe.size > 0:
+            logging.info(f"ND min={np.nanmin(nd_safe, axis=0)}, max={np.nanmax(nd_safe, axis=0)}, mean={np.nanmean(nd_safe, axis=0)}")
         if pf_safe.size > 0:
-            # floor reference values (only positive floor); keep sign if there are negatives
-            tiny = 1e-12
-            pf_safe = np.where(np.abs(pf_safe) < PF_RANGE_FLOOR, np.sign(pf_safe) * PF_RANGE_FLOOR, pf_safe)
+            logging.info(f"PF min={np.nanmin(pf_safe, axis=0)}, max={np.nanmax(pf_safe, axis=0)}, mean={np.nanmean(pf_safe, axis=0)}")
 
-        hv_val = np.nan
-        igd_val = np.nan
-        eps_a = np.nan
-        eps_m = np.nan
+        # compute metrics using union-normalization
+        metrics = compute_metrics(nd_safe, pf_safe)
 
-        # HV: compute only if we have both sets and no degenerate issues
-        if nd_arr.size > 0 and pf_safe.size > 0:
-            try:
-                # make reference that strictly dominates both reference and nd points
-                ref_candidate = np.max(np.vstack([pf_safe, nd_arr]), axis=0) * 1.1
-                # ensure ref > nd_arr for all dims
-                if np.any(ref_candidate <= np.max(nd_arr, axis=0)):
-                    ref_candidate = np.max(np.vstack([pf_safe, nd_arr]), axis=0) + 1.0
-                hv_val = hypervolume(nd_arr, ref_candidate)
-            except Exception as e:
-                logging.warning(f"HV computation failed for {nm}, {ea_name}: {e}")
-                hv_val = np.nan
-
-            # IGD and epsilons
-            try:
-                igd_val = igd(nd_arr, pf_safe)
-            except Exception as e:
-                logging.warning(f"IGD failed for {nm}, {ea_name}: {e}")
-                igd_val = np.nan
-
-            try:
-                eps_a = eps_additive(nd_arr, pf_safe)
-            except Exception as e:
-                logging.warning(f"EpsAdd failed for {nm}, {ea_name}: {e}")
-                eps_a = np.nan
-
-            try:
-                eps_m = eps_multiplicative(nd_arr, pf_safe)
-            except Exception as e:
-                logging.warning(f"EpsMulti failed for {nm}, {ea_name}: {e}")
-                eps_m = np.nan
-        else:
-            logging.warning(f"Skipping metrics for {nm} {ea_name}: nd_arr={nd_arr.shape}, pf_arr={pf_arr.shape}")
-
-        logging.info(f"Reference PF for {nm}: shape={pf_arr.shape}, ND shape={nd_arr.shape}")
-        logging.info(f"{ea_name} done on {nm}: IGD={igd_val}, HV={hv_val}, EpsAdd={eps_a}, EpsMulti={eps_m}, nd_pts={nd_arr.shape[0]}")
-
-
-        # --- Store results ---
+        # store results
         results[ea_name] = dict(
-            IGD_norm=igd_val,
-            HV=hv_val,
-            EpsAdd=eps_a,
-            EpsMulti=eps_m,
-            nd_arr=nd_arr
+            IGD_norm=metrics["IGD_norm"],
+            HV=metrics["HV"],
+            EpsAdd=metrics["EpsAdd"],
+            EpsMulti=metrics["EpsMulti"],
+            nd_arr=nd_safe
         )
 
+    # ---------- Combined across all EAs ----------
+    all_nd = [r["nd_arr"] for r in results.values() if r["nd_arr"].size > 0]
+    if len(all_nd) > 0:
+        combined_all = np.vstack(all_nd)
+        combined_nd = nondominated_filter(combined_all)
+    else:
+        combined_nd = np.empty((0, no))
 
-        logging.info(f"{ea_name} done on {nm}: IGD={igd_val}, HV={hv_val}, EpsAdd={eps_a}, EpsMulti={eps_m}, nd_pts={nd_arr.shape[0]}")
+    # reference PF for combined
+    pf_arr = reference_pfs.get(nm, None)
+    if pf_arr is None or pf_arr.size == 0:
+        try:
+            pf_arr = find_reference_pf(nm, no, nv)
+            if pf_arr is not None and pf_arr.size > 0:
+                reference_pfs[nm] = pf_arr
+        except Exception:
+            pf_arr = np.empty((0, no))
+
+    pf_safe = sanitize_pf(pf_arr, no)
+    combined_nd = apply_maximize_inversion(combined_nd, maximize_flags)
+    pf_safe = apply_maximize_inversion(pf_safe, maximize_flags)
+
+    combined_metrics = compute_metrics(combined_nd, pf_safe)
+
+    logging.info(
+        f"Combined metrics for {nm}: IGD={combined_metrics['IGD_norm']}, HV={combined_metrics['HV']}, "
+        f"EpsAdd={combined_metrics['EpsAdd']}, EpsMulti={combined_metrics['EpsMulti']}, combined_nd_shape={combined_nd.shape}"
+    )
+
+    results["Combined"] = dict(
+        IGD_norm=combined_metrics["IGD_norm"],
+        HV=combined_metrics["HV"],
+        EpsAdd=combined_metrics["EpsAdd"],
+        EpsMulti=combined_metrics["EpsMulti"],
+        nd_arr=combined_nd
+    )
 
     return results
-
-
-
 
 def _append_df_to_csv(df_row, fp, cols):
     """Append a single-row dataframe to CSV safely (create header when file absent)."""
     header = not os.path.exists(fp)
     df_row.to_csv(fp, mode='a', header=header, index=False)
 
-
 def build_and_train_surrogates(nm, nv, no, X, Y, algo_nm, algo_fn, noise_tag):
-    """
-    Train surrogates for all objectives for a given algorithm and return trained models.
-    Immediately saves R2 and MSE to surrogate_perf.csv (append-mode).
-    """
     ml_list = []
+
+    # --- Clean and validate data ---
+    X = X.copy()
+    Y = Y.copy()
+    valid_mask = np.all(np.isfinite(X), axis=1) & np.all(np.isfinite(Y), axis=1)
+    X = X.loc[valid_mask]
+    Y = Y.loc[valid_mask]
+
+    if len(X) < 5:
+        logging.warning(f"Too few samples ({len(X)}) for {nm} - skipping surrogate training.")
+        return [None] * no
+
+    # --- Normalize inputs globally to [0, 1] for stability ---
+    X_min, X_max = X.min(), X.max()
+    X_scaled = (X - X_min) / (X_max - X_min + 1e-12)
+
+    # --- Choose cross-validation folds adaptively ---
+    if len(X_scaled) >= 100:
+        n_splits = 5
+    elif len(X_scaled) >= 30:
+        n_splits = 3
+    else:
+        n_splits = 2
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=BASE_SEED)
+
+    # --- Train one surrogate per objective ---
     for obj_idx in range(no):
         best_model = None
         try:
+            y = Y.iloc[:, obj_idx].astype(float)
+            if y.nunique() <= 1:
+                logging.warning(f"Objective f{obj_idx+1} constant for {nm}. Skipping.")
+                ml_list.append(None)
+                continue
+
+            # Model pipeline: scale X, scale target internally
             model_pipe = Pipeline([
-                ('scale', StandardScaler()),
-                ('model', TransformedTargetRegressor(regressor=algo_fn()))
+                ('scaler', StandardScaler()),
+                ('model', TransformedTargetRegressor(
+                    regressor=algo_fn(),
+                    check_inverse=False
+                ))
             ])
-            kf = KFold(n_splits=3, shuffle=True, random_state=BASE_SEED)
-            scores = cross_validate(model_pipe, X, Y.iloc[:, obj_idx], cv=kf,
-                                    scoring=('r2','neg_mean_squared_error'))
-            model_pipe.fit(X, Y.iloc[:, obj_idx])
+
+            # Cross-validation evaluation
+            scores = cross_validate(
+                model_pipe, X_scaled, y, cv=kf,
+                scoring=('r2', 'neg_mean_squared_error'),
+                n_jobs=-1, error_score='raise'
+            )
+
+            # Fit final model on all data
+            model_pipe.fit(X_scaled, y)
             best_model = model_pipe
 
-            # Save surrogate performance immediately (append)
-            row = [nm, nv, no, algo_nm, noise_tag, f"f{obj_idx+1}",
-                   float(scores['test_r2'].mean()), float(-scores['test_neg_mean_squared_error'].mean())]
+            mean_r2 = float(scores['test_r2'].mean())
+            std_r2 = float(scores['test_r2'].std())
+            mean_mse = float(-scores['test_neg_mean_squared_error'].mean())
+
+            # Append to performance log
+            row = [nm, nv, no, algo_nm, noise_tag, f"f{obj_idx+1}", mean_r2, mean_mse]
             row_df = pd.DataFrame([row], columns=perf_cols)
-
-            # Append to file
             _append_df_to_csv(row_df, perf_fp, perf_cols)
-
-            # Keep in-memory copy to avoid re-saving duplicates in same run
             existing_perf.loc[len(existing_perf)] = row
 
-            logging.info(f"Saved perf for {nm} {algo_nm} f{obj_idx+1}: R2={row[6]:.4f} MSE={row[7]:.4g}")
+            logging.info(
+                f"{nm} | {algo_nm} | f{obj_idx+1}: "
+                f"R2={mean_r2:.4f} ± {std_r2:.4f}, MSE={mean_mse:.3e}, "
+                f"n_splits={n_splits}, samples={len(X_scaled)}"
+            )
 
         except Exception as e:
-            logging.warning(f"Surrogate training failed for {nm}, {algo_nm}, f{obj_idx+1}: {e}\n{traceback.format_exc()}")
+            logging.warning(
+                f"Surrogate training failed for {nm}, {algo_nm}, f{obj_idx+1}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
             best_model = None
 
         ml_list.append(best_model)
 
     return ml_list
 
-
 # ========================= MAIN LOOP =========================
 data_root = path.join(base_folder, "Data")
 n_iterations = 1
 n_gen_per_iter = 50
 fallback_warned = set()
-
-# Make sure we’re working with the global objects throughout
-# global existing_pf, existing_perf
+reference_pfs = {}
 
 if existing_pf is None or not isinstance(existing_pf, pd.DataFrame):
     existing_pf = pd.DataFrame(columns=pf_cols)
@@ -684,7 +881,10 @@ if existing_pf is None or not isinstance(existing_pf, pd.DataFrame):
 if existing_perf is None or not isinstance(existing_perf, pd.DataFrame):
     existing_perf = pd.DataFrame(columns=perf_cols)
 
-for suite in ["DTLZ","WFG","Engineering","DBMOPP"]:
+# --- Define global cache for loaded reference Pareto fronts ---
+reference_pfs = {}
+
+for suite in ["DTLZ", "WFG", "Engineering", "DBMOPP"]:
     if args.suite != "ALL" and args.suite != suite:
         continue
     suite_dir = path.join(data_root, suite)
@@ -703,7 +903,6 @@ for suite in ["DTLZ","WFG","Engineering","DBMOPP"]:
         logging.info(f"Processing problem {prob_name} with {len(files)} datasets")
 
         for fn in sorted(files):
-
             try:
                 fpath = path.join(prob_dir, fn)
                 nm, nv, no, samples, noise_tag = extract_details(fn)
@@ -727,32 +926,40 @@ for suite in ["DTLZ","WFG","Engineering","DBMOPP"]:
                         logging.warning(f"Skipping EA for {nm} with {algo_nm}: some surrogates failed to train.")
                         continue
 
-                    # Prepare storage per-EA over multiple iterations
-                    all_nd_solutions = { "NSGAIII": [], "RVEA": [], "IBEA": [] }
+                    # --- Load and cache reference PF (once per problem) ---
+                    pf_arr = find_reference_pf(nm, no, nv)
+                    if pf_arr.size > 0:
+                        reference_pfs[nm] = pf_arr
+                        logging.info(f"Cached reference PF for {nm} ({pf_arr.shape})")
+                    else:
+                        logging.warning(f"No reference PF found for {nm} before EA runs.")
 
-                    # Run multiple iterations: call run_all_eas once per iteration (it returns all 3 EAs)
+                    # Prepare storage per-EA over multiple iterations
+                    all_nd_solutions = {"NSGAIII": [], "RVEA": [], "IBEA": [], "Combined": []}
+
+                    # Run multiple iterations
                     for iter_idx in range(n_iterations):
-                        logging.info(f"Iteration {iter_idx+1}/{n_iterations} for {nm} with {algo_nm}")
+                        logging.info(f"Iteration {iter_idx + 1}/{n_iterations} for {nm} with {algo_nm}")
                         try:
                             ea_results = run_all_eas(nm, nv, no, ml_list, lb, ub, n_gen=n_gen_per_iter)
                         except Exception as e:
                             logging.warning(f"run_all_eas failed on {nm} {algo_nm} iter {iter_idx}: {e}\n{traceback.format_exc()}")
                             continue
 
-                        # Log sizes and collect per-ea nd arrays
+                        # Collect per-EA ND arrays
                         for ea_name, data in ea_results.items():
-                            nd = data.get('nd_arr', np.empty((0,no)))
+                            nd = data.get('nd_arr', np.empty((0, no)))
                             shape_info = nd.shape if isinstance(nd, np.ndarray) else 'None'
-                            logging.info(f"Iter {iter_idx+1} - {nm} {algo_nm} {ea_name} ND shape: {shape_info}")
+                            logging.info(f"Iter {iter_idx + 1} - {nm} {algo_nm} {ea_name} ND shape: {shape_info}")
                             if isinstance(nd, np.ndarray) and nd.size > 0:
                                 all_nd_solutions[ea_name].append(nd)
 
-                    # After iterations, process each EA's aggregated solutions
+                    # --- After iterations, process each EA's aggregated solutions ---
                     for ea_name in ["NSGAIII", "RVEA", "IBEA"]:
                         nd_list = all_nd_solutions.get(ea_name, [])
                         if len(nd_list) > 0:
                             merged = np.vstack(nd_list)
-                            # non-dominated filter
+                            # non-dominated filtering
                             npts = merged.shape[0]
                             is_nd = np.ones(npts, dtype=bool)
                             for i in range(npts):
@@ -769,36 +976,57 @@ for suite in ["DTLZ","WFG","Engineering","DBMOPP"]:
                             final_nd = np.empty((0, no))
 
                         # --- Compute metrics against real PF ---
-                        pf_arr = find_reference_pf(nm, no, nv)
+                        # Try to retrieve from cache or load it once if missing
+                        pf_arr = reference_pfs.get(nm, None)
+                        if pf_arr is None or pf_arr.size == 0:
+                            pf_arr = find_reference_pf(nm, no, nv)
+                            if pf_arr.size > 0:
+                                reference_pfs[nm] = pf_arr  # cache it now for future use
+                                logging.info(f"Late-cached reference PF for {nm} after EA runs ({pf_arr.shape})")
+                            else:
+                                logging.warning(f"No reference PF found for {nm} in final aggregation — metrics will be NaN.")
+                        
                         final_nd = epsilon_cleanup(final_nd, EPS_CLEAN)
-
+                        
                         hv_val = np.nan
                         if final_nd.size > 0 and pf_arr.size > 0:
-                            try:
-                                hv_val = hypervolume(final_nd, pf_arr.max(axis=0)+1)
-                            except Exception as e:
-                                logging.warning(f"HV failed for {nm} {algo_nm} {ea_name}: {e}")
-
+                            # remove NaNs and infs
+                            if np.any(~np.isfinite(final_nd)) or np.any(~np.isfinite(pf_arr)):
+                                logging.warning(f"Non-finite values detected in PF for {nm}, skipping HV normalization.")
+                            else:
+                                # Union-based normalization
+                                combined = np.vstack((pf_arr, final_nd))
+                                mins, maxs = combined.min(axis=0), combined.max(axis=0)
+                                span = np.where(maxs - mins == 0, 1, maxs - mins)
+                                pf_norm = (pf_arr - mins) / span
+                                nd_norm = (final_nd - mins) / span
+                        
+                                try:
+                                    ref_point = np.ones(no)  # dominates all [0,1] normalized points
+                                    hv_val = hypervolume(nd_norm, ref_point)
+                                except Exception as e:
+                                    logging.warning(f"HV failed for {nm} {algo_nm} {ea_name}: {e}")
+                        
                         igd_val = igd(final_nd, pf_arr)
                         eps_a = eps_additive(final_nd, pf_arr)
                         eps_m = eps_multiplicative(final_nd, pf_arr)
+                        
+                        logging.info(
+                            f"Computed metrics for {nm} {algo_nm} {ea_name} -> IGD={igd_val}, HV={hv_val}, "
+                            f"EpsAdd={eps_a}, EpsMulti={eps_m}, final_nd_shape={final_nd.shape}"
+                        )
 
-                        logging.info(f"Computed metrics for {nm} {algo_nm} {ea_name} -> IGD={igd_val}, HV={hv_val}, EpsAdd={eps_a}, EpsMulti={eps_m}, final_nd_shape={final_nd.shape}")
-
-                        # --- Save single row for this EA (append-mode) ---
+                        # --- Save metrics row ---
                         row = [nm, nv, no, algo_nm, ea_name, noise_tag,
                                igd_val, hv_val, eps_a, eps_m,
-                               np.nan, np.nan, np.nan, RUN_TAG]
+                               RUN_TAG]
                         row_df = pd.DataFrame([row], columns=pf_cols)
 
                         try:
                             _append_df_to_csv(row_df, pf_fp, pf_cols)
 
-                            # Make sure existing_pf is defined in locals (safety)
                             if 'existing_pf' not in locals() or existing_pf is None:
                                 existing_pf = pd.DataFrame(columns=pf_cols)
-
-                            # Safe concat: if existing_pf is empty create copy, else concat
                             if existing_pf.empty:
                                 existing_pf = row_df.copy()
                             else:
@@ -810,6 +1038,5 @@ for suite in ["DTLZ","WFG","Engineering","DBMOPP"]:
 
             except Exception as e:
                 logging.exception(f"Fatal error processing file {fn}: {e}\n{traceback.format_exc()}")
-                # continue to next file
 
 logging.info("========== SCRIPT END ==========")
