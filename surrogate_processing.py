@@ -62,8 +62,8 @@ args = parser.parse_args()
 
 # ================== EXPERIMENT KNOBS ==================
 BASE_SEED   = 2025
-POP_SIZE    = 150
-N_GEN       = 50
+POP_SIZE    = 100
+N_GEN       = 20
 EPS_CLEAN       = 1e-3
 PF_RANGE_FLOOR  = 1e-9
 RUN_TAG = f"EA_pop{POP_SIZE}_gen{N_GEN}_seed{BASE_SEED}_eps{EPS_CLEAN}"
@@ -91,8 +91,11 @@ logging.info(f"RUN_TAG={RUN_TAG}  SELECTED_SUITE={args.suite}")
 # ----- Output files -----
 pf_fp = path.join(out_dir, 'surrogate_metrics.csv')
 perf_fp = path.join(out_dir, 'surrogate_perf.csv')
-pf_cols = ['Problem','VarCount','ObjCount','Algorithm','EA','NoiseTag',
-           'IGD_norm','HV','EpsAdd','EpsMulti','IGD_seed_cv','IGD_q25','IGD_q75','RunTag']
+
+pf_cols = ["problem", "n_var", "n_obj", "algo", "EA", "noise", 
+           "IGD", "HV", "EpsAdd", "EpsMulti", "RUN_TAG"]
+
+           
 perf_cols = ['Problem','VarCount','ObjCount','Algorithm','NoiseTag','Objective','R2','MSE']
 
 def load_existing(fp, cols):
