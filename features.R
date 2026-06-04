@@ -1,158 +1,331 @@
-# Set the custom library path explicitly in the R script
-.libPaths("/projappl/project_2012636/rpackages")
+#!/usr/bin/env Rscript
 
-# Load the flacco library
-library(flacco)
+# =========================================================
+# Compute ELA features for DTLZ, WFG, and DBMOPP datasets
+# =========================================================
 
-# Define the root folder where your data is stored
-root_folder   = "/scratch/project_2012636/Data"
+# -------------------------
+# 1) Custom library path
+# -------------------------
+.libPaths(c("/projappl/project_2017216/rpackages", .libPaths()))
 
-# Define the output directory and the tracking file
-output_dir    = "/scratch/project_2012636/modelling_results"
-tracking_file = file.path(output_dir, "processed_files_R.csv")
-output_csv = file.path(output_dir, "features.csv")
+suppressPackageStartupMessages({
+  library(flacco)
+  library(dplyr)
+})
 
-# List all subfolders within the root directory
-folders = list.dirs(root_folder, recursive = TRUE)
+# -------------------------
+# 2) Paths
+# -------------------------
+root_folder   <- "/scratch/project_2017216/Data"
+output_dir    <- "/scratch/project_2017216/modelling_results"
+tracking_file <- file.path(output_dir, "processed_files_R.csv")
+output_csv    <- file.path(output_dir, "features.csv")
 
-# Function to clean column names (handles cases like 'x_1' vs 'x1')
-clean_column_names <- function(cnames) {
-  gsub("x_", "x", cnames)  # Replaces 'x_' with 'x'
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 }
 
-# Corrected feature sets
-calc_feature_sets = c(
-  # "ela_conv",         # convexity (requires an exact function)
-  # "ela_curv",         # curvature (requires an exact function)
-  # "ela_level",        # levelset (requires an exact function)
-  # "ela_local",        # local search (requires an exact function)
-  "ela_meta",         # metamodel features
-  "ela_distr",        # y-distribution
-  "basic",            # basic features
-  "disp",             # dispersion features
-  "ic",               # information content features
-  "nbc",              # nearest better clustering
-  "pca",              # principal component analysis features
-  "cm_angle"          # corrected from "cma" to "cm_angle" (cell mapping angle features)
+# -------------------------
+# 3) Folders to process
+# -------------------------
+folders <- list.dirs(root_folder, recursive = TRUE, full.names = TRUE)
+folders <- folders[grepl("DTLZ|WFG|DBMOPP|Engineering", folders, ignore.case = TRUE)]
+
+cat("Found", length(folders), "candidate folders\n")
+
+# -------------------------
+# 4) Config
+# -------------------------
+NORMALIZE_XY <- TRUE
+Y_TRANSFORM  <- "rank"   # "rank" | "minmax" | "none"
+
+COLLAPSE_DUP_X     <- TRUE
+DEDUP_AGG          <- "median"  # "median" | "mean"
+DEDUP_ROUND_DIGITS <- 6
+
+calc_feature_sets <- c(
+  "ela_meta", "ela_distr", "basic", "disp",
+  "ic", "nbc", "pca", "cm_angle"
 )
 
-# Initialize a final data.frame to store one row per (file + f-column)
-all_features = data.frame()
-
-# Load existing processed files list, considering skipped features
+# -------------------------
+# 5) Tracking file
+# -------------------------
 if (file.exists(tracking_file)) {
   processed_files_df <- read.csv(tracking_file, stringsAsFactors = FALSE)
-  processed_files <- processed_files_df$file
+  needed_cols <- c("file", "f_col")
+  for (cc in needed_cols) {
+    if (!cc %in% names(processed_files_df)) {
+      processed_files_df[[cc]] <- NA_character_
+    }
+  }
+  processed_files_df <- processed_files_df[, needed_cols, drop = FALSE]
 } else {
-  processed_files <- character()  # Empty if no tracking file exists
+  processed_files_df <- data.frame(
+    file = character(),
+    f_col = character(),
+    stringsAsFactors = FALSE
+  )
 }
 
-# Clear the output CSV to avoid old data
-if (file.exists(output_csv)) {
-  file.remove(output_csv)
+# -------------------------
+# 6) Helpers
+# -------------------------
+clean_column_names <- function(cnames) {
+  cnames <- gsub("^x_", "x", cnames)
+  cnames <- gsub("^f_", "f", cnames)
+  cnames
 }
 
-# Loop over subfolders
+scale01 <- function(v) {
+  rng <- range(v, finite = TRUE, na.rm = TRUE)
+  if (!all(is.finite(rng)) || diff(rng) == 0) {
+    return(rep(0.5, length(v)))
+  }
+  (v - rng[1]) / (rng[2] - rng[1])
+}
+
+rank01 <- function(v) {
+  r <- rank(v, ties.method = "average", na.last = "keep")
+  rr <- range(r, finite = TRUE, na.rm = TRUE)
+  if (!all(is.finite(rr)) || diff(rr) == 0) {
+    return(rep(0.5, length(v)))
+  }
+  (r - rr[1]) / (rr[2] - rr[1])
+}
+
+collapse_duplicates <- function(X, y, agg = "median", round_digits = NA) {
+  Xw <- as.data.frame(X)
+
+  if (is.numeric(round_digits) && is.finite(round_digits)) {
+    Xw[] <- lapply(Xw, function(col) {
+      if (is.numeric(col)) round(col, digits = round_digits) else col
+    })
+  }
+
+  df <- cbind(Xw, .y = y)
+  fun <- if (identical(agg, "mean")) mean else median
+
+  out <- stats::aggregate(.y ~ ., data = df, FUN = fun)
+
+  list(
+    X = out[, !(names(out) %in% ".y"), drop = FALSE],
+    y = out$.y
+  )
+}
+
+safe_noise_tag <- function(fname) {
+  fname_lower <- tolower(fname)
+
+  if (grepl("_noise", fname_lower)) {
+    return("noise")
+  } else if (grepl("truncnorm|normal", fname_lower)) {
+    return("normal")
+  } else if (grepl("uniform", fname_lower)) {
+    return("uniform")
+  } else {
+    return("none")
+  }
+}
+
+safe_feature_set <- function(feat.object, fs_name) {
+  tryCatch({
+    calculateFeatureSet(feat.object, set = fs_name)
+  }, error = function(e) {
+    cat("    [WARN] Feature set failed:", fs_name, "|", conditionMessage(e), "\n")
+    return(NULL)
+  })
+}
+
+append_csv_row <- function(df_row, csv_path) {
+  if (!file.exists(csv_path)) {
+    write.csv(df_row, csv_path, row.names = FALSE)
+  } else {
+    write.table(
+      df_row,
+      csv_path,
+      sep = ",",
+      row.names = FALSE,
+      col.names = FALSE,
+      append = TRUE
+    )
+  }
+}
+
+already_processed <- function(file, f_col, processed_df) {
+  any(processed_df$file == file & processed_df$f_col == f_col)
+}
+
+# -------------------------
+# 7) Main loop
+# -------------------------
 for (folder in folders) {
-  # Get all .csv files
-  files = list.files(path = folder, full.names = TRUE, pattern = "\\.csv$")
+  files <- list.files(folder, full.names = TRUE, pattern = "\\.csv$", ignore.case = TRUE)
+
+  if (length(files) == 0) next
+
+  cat("\n====================================================\n")
+  cat("Folder:", folder, "\n")
+  cat("Files found:", length(files), "\n")
+  cat("====================================================\n")
 
   for (file in files) {
-    # Skip the file if it's already processed
-    if (file %in% processed_files) {
-      cat("Skipping already processed file:", file, "\n")
+    cat("\n[INFO] Reading file:", file, "\n")
+
+    dat <- tryCatch(
+      read.csv(file, stringsAsFactors = FALSE),
+      error = function(e) {
+        cat("[WARN] Could not read file:", file, "|", conditionMessage(e), "\n")
+        return(NULL)
+      }
+    )
+
+    if (is.null(dat)) next
+    if (nrow(dat) == 0) {
+      cat("[WARN] Empty file, skipping:", file, "\n")
       next
     }
 
-    cat("\nProcessing file:", file, "\n")
-    dat = read.csv(file)
-    colnames(dat) = clean_column_names(colnames(dat))
+    colnames(dat) <- clean_column_names(colnames(dat))
 
-    num_sample = nrow(dat)
-    num_cols   = ncol(dat)
-    # Check if the file name contains 'uniform'
-    is_uni = as.integer(grepl("uniform", file)) 
+    input_idx  <- grep("^x[0-9]+$", colnames(dat))
+    output_idx <- grep("^f[0-9]+$", colnames(dat))
 
-    # Identify the input columns (starting with 'x') and output columns (starting with 'f')
-    input_cols  = grep("^x", colnames(dat))
-    output_cols = grep("^f", colnames(dat))
+    if (length(input_idx) == 0 || length(output_idx) == 0) {
+      cat("[WARN] Could not find x/f columns, skipping:", file, "\n")
+      next
+    }
 
-    # Convert inputs to numeric
-    inputs = dat[, input_cols, drop = FALSE]
-    inputs = apply(inputs, 2, as.numeric)
+    Problem     <- basename(dirname(file))
+    VarCount    <- length(input_idx)
+    ObjCount    <- length(output_idx)
+    num_samples <- nrow(dat)
+    noise_tag   <- safe_noise_tag(basename(file))
+    is_uniform  <- as.integer(noise_tag == "uniform")
 
-    # Keep track of skipped features
-    skipped_features = c()
+    for (j in output_idx) {
+      out_name <- colnames(dat)[j]
 
-    # For each output column, calculate the specified feature sets
-    for (output_col in output_cols) {
-      out_name = colnames(dat)[output_col]
-      outputs  = as.numeric(dat[, output_col])
+      if (already_processed(file, out_name, processed_files_df)) {
+        cat("[INFO] Skipping already processed file/objective:", file, "|", out_name, "\n")
+        next
+      }
 
-      # Create FeatureObject
-      feat.object = createFeatureObject(X = inputs, y = outputs)
+      cat("[INFO] Processing objective:", out_name, "\n")
 
-      # Prepare one-row data frame to collect all features for this (file + f-col)
-      one_row = data.frame(
-        file_name      = file,
-        f_col          = out_name,
-        num_samples    = num_sample,
-        dimensionality = length(input_cols),
-        is_uniform     = is_uni,
+      inputs  <- dat[, input_idx, drop = FALSE]
+      outputs <- suppressWarnings(as.numeric(dat[, j]))
+
+      valid_mask <- complete.cases(inputs) & is.finite(outputs)
+      inputs  <- inputs[valid_mask, , drop = FALSE]
+      outputs <- outputs[valid_mask]
+
+      if (nrow(inputs) < 10) {
+        cat("[WARN] Too few valid rows after filtering for", out_name, "- skipping\n")
+        next
+      }
+
+      before_n <- nrow(inputs)
+
+      if (isTRUE(COLLAPSE_DUP_X)) {
+        cd <- collapse_duplicates(
+          X = inputs,
+          y = outputs,
+          agg = DEDUP_AGG,
+          round_digits = DEDUP_ROUND_DIGITS
+        )
+        inputs  <- cd$X
+        outputs <- cd$y
+
+        cat(sprintf(
+          "  Dedup: %d -> %d rows (agg=%s, round=%s)\n",
+          before_n, nrow(inputs), DEDUP_AGG,
+          ifelse(is.na(DEDUP_ROUND_DIGITS), "none", as.character(DEDUP_ROUND_DIGITS))
+        ))
+      }
+
+      if (nrow(inputs) < 10) {
+        cat("[WARN] Too few rows after dedup for", out_name, "- skipping\n")
+        next
+      }
+
+      if (isTRUE(NORMALIZE_XY)) {
+        inputs <- as.data.frame(lapply(inputs, scale01))
+
+        if (Y_TRANSFORM == "rank") {
+          outputs <- rank01(outputs)
+        } else if (Y_TRANSFORM == "minmax") {
+          outputs <- scale01(outputs)
+        } else if (Y_TRANSFORM == "none") {
+          outputs <- outputs
+        } else {
+          cat("[WARN] Unknown Y_TRANSFORM =", Y_TRANSFORM, "-> using raw y\n")
+        }
+      }
+
+      feat.object <- tryCatch({
+        createFeatureObject(X = inputs, y = outputs)
+      }, error = function(e) {
+        cat("[WARN] createFeatureObject failed for", file, out_name, "|", conditionMessage(e), "\n")
+        return(NULL)
+      })
+
+      if (is.null(feat.object)) next
+
+      one_row <- data.frame(
+        Problem     = Problem,
+        VarCount    = VarCount,
+        ObjCount    = ObjCount,
+        num_samples = num_samples,
+        is_uniform  = is_uniform,
+        NoiseTag    = noise_tag,
+        f_col       = out_name,
         stringsAsFactors = FALSE
       )
 
-      # Initialize a non-empty data frame to avoid binding issues
-      combined_sets_df = data.frame(dummy_col = NA)
+      combined_sets_df <- data.frame(dummy = NA, stringsAsFactors = FALSE)
 
-      # Calculate each feature set and check for empty results
       for (fs_name in calc_feature_sets) {
-        cat("  Calculating set:", fs_name, "for", out_name, "\n")
-        tmp = tryCatch({
-          data.frame(calculateFeatureSet(feat.object, set = fs_name))
-        }, error = function(e) {
-          cat("  Warning: No features generated for", fs_name, "\n")
-          skipped_features = c(skipped_features, fs_name)
-          return(data.frame())
-        })
+        cat("  └─ set:", fs_name, "for", out_name, "\n")
 
-        # Only add features if non-empty and matching row counts
-        if (nrow(tmp) > 0 && ncol(tmp) > 0) {
-          colnames(tmp) = paste0(fs_name, "_", colnames(tmp))
-          combined_sets_df = cbind(combined_sets_df, tmp)
+        tmp <- safe_feature_set(feat.object, fs_name)
+
+        if (!is.null(tmp) && length(tmp) > 0) {
+          vec <- unlist(tmp)
+
+          if (!all(is.na(vec))) {
+            tmp_df <- as.data.frame(t(vec), stringsAsFactors = FALSE)
+            colnames(tmp_df) <- paste0(fs_name, "_", names(vec))
+            combined_sets_df <- cbind(combined_sets_df, tmp_df)
+          } else {
+            cat("    [WARN] all NA for", fs_name, "- skipping\n")
+          }
         } else {
-          cat("  Skipping feature set due to empty results: ", fs_name, "\n")
+          cat("    [WARN] empty result for", fs_name, "- skipping\n")
         }
       }
 
-      # Remove the placeholder column if it still exists
-      combined_sets_df = combined_sets_df[ , !colnames(combined_sets_df) %in% c("dummy_col")]
+      combined_sets_df <- combined_sets_df[, setdiff(names(combined_sets_df), "dummy"), drop = FALSE]
 
-      # Bind the combined features to the identifying columns if data exists
       if (ncol(combined_sets_df) > 0) {
-        one_row = cbind(one_row, combined_sets_df)
-
-        # Save results incrementally after each file is processed
-        if (!file.exists(output_csv)) {
-          write.csv(one_row, file = output_csv, row.names = FALSE)
-        } else {
-          write.table(one_row, file = output_csv, sep = ",", col.names = FALSE, row.names = FALSE, append = TRUE)
-        }
+        out_row <- cbind(one_row, combined_sets_df)
+        append_csv_row(out_row, output_csv)
       } else {
-        cat("  No valid features generated for", out_name, "\n")
+        cat("  [WARN] no valid features for", out_name, "- row skipped\n")
       }
 
-      # Prepare processed file entry including skipped features
-      processed_entry <- data.frame(file = file, skipped_features = paste(skipped_features, collapse = ", "))
+      entry <- data.frame(
+        file = file,
+        f_col = out_name,
+        stringsAsFactors = FALSE
+      )
+      append_csv_row(entry, tracking_file)
 
-      # Log the processed file and skipped features to the tracking file
-      if (!file.exists(tracking_file)) {
-        write.csv(processed_entry, tracking_file, row.names = FALSE)
-      } else {
-        write.table(processed_entry, file = tracking_file, sep = ",", col.names = FALSE, row.names = FALSE, append = TRUE)
-      }
+      processed_files_df <- rbind(processed_files_df, entry)
     }
   }
 }
 
-cat("\nAll features have been saved to:", output_csv, "\n")
+cat("\n✅ All features written to:", output_csv, "\n")
+cat("✅ Tracking file updated at:", tracking_file, "\n")
